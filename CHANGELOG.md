@@ -5,6 +5,19 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.6] - 2026-07-15
+
+### Changed
+
+- Advanced the fork version from `1.3.2+custom.5` to `1.3.2+custom.6`.
+
+### Fixed
+
+- YouTube batch manifests now retry atomic replacement when Windows temporarily
+  locks the destination JSON through a reader, antivirus, or file indexer.
+- Temporary manifest files are cleaned after both successful and failed saves,
+  while the previous valid JSON remains untouched if all retries fail.
+
 ## [1.3.2+custom.5] - 2026-07-15
 
 ### Added

@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import re
@@ -16,6 +17,11 @@ from app.utils import utils
 SCHEMA_VERSION = 4
 EXECUTION_MODES = {"interleaved", "generate_all_first"}
 IDEA_MODES = {"ai", "manual", "legacy"}
+
+_REPLACE_RETRY_DELAYS = (
+    0.05, 0.1, 0.2, 0.4, 0.8,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+)
 
 _IDEA_STOPWORDS = {
     "a", "al", "con", "de", "del", "el", "ella", "en", "la", "las", "lo",
@@ -470,9 +476,39 @@ class YouTubeBatchStore:
             batch["updated_at"] = datetime.now(timezone.utc).isoformat()
             destination = self._path(batch["batch_id"])
             temporary = f"{destination}.{uuid4().hex}.tmp"
-            with open(temporary, "w", encoding="utf-8") as file:
-                json.dump(batch, file, ensure_ascii=False, indent=2)
-            os.replace(temporary, destination)
+            try:
+                with open(temporary, "w", encoding="utf-8") as file:
+                    json.dump(batch, file, ensure_ascii=False, indent=2)
+                self._replace_with_retry(temporary, destination)
+            finally:
+                try:
+                    os.remove(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    # A scanner may briefly retain the temporary file too. It is
+                    # harmless and can be cleaned by the next storage maintenance.
+                    pass
+
+    @staticmethod
+    def _replace_with_retry(source: str, destination: str) -> None:
+        """Atomically replace a manifest despite transient Windows file locks."""
+
+        delays = (*_REPLACE_RETRY_DELAYS, None)
+        for delay in delays:
+            try:
+                os.replace(source, destination)
+                return
+            except OSError as exc:
+                transient = (
+                    isinstance(exc, PermissionError)
+                    or getattr(exc, "winerror", None) in {5, 32, 33}
+                    or getattr(exc, "errno", None)
+                    in {errno.EACCES, errno.EPERM, errno.EBUSY}
+                )
+                if not transient or delay is None:
+                    raise
+                time.sleep(delay)
 
     def _normalize(self, batch: dict) -> dict:
         """Add durable runner fields without invalidating older manifests."""

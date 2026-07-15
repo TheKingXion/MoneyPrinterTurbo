@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 import json
+import os
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from app.services.youtube_batch import (
     SCHEMA_VERSION,
@@ -138,6 +140,56 @@ class TestYouTubeBatch(unittest.TestCase):
         self.assertEqual(loaded["items"][0]["generation_status"], "generated")
         self.assertEqual(loaded["items"][0]["video_path"], "video.mp4")
         self.assertEqual(listed[0]["batch_id"], batch["batch_id"])
+
+    def test_save_retries_transient_windows_replace_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = YouTubeBatchStore(directory)
+            real_replace = os.replace
+            attempts = 0
+
+            def flaky_replace(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    error = PermissionError(13, "manifest is temporarily locked")
+                    error.winerror = 5
+                    raise error
+                return real_replace(source, destination)
+
+            with (
+                patch(
+                    "app.services.youtube_batch.os.replace",
+                    side_effect=flaky_replace,
+                ),
+                patch("app.services.youtube_batch.time.sleep") as sleep,
+            ):
+                batch = store.create(["Subject"], [], {})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(store.load(batch["batch_id"])["batch_id"], batch["batch_id"])
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(directory)))
+
+    def test_failed_replace_preserves_manifest_and_cleans_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = YouTubeBatchStore(directory)
+            batch = store.create(["Subject"], [], {})
+            batch["status"] = "generating"
+            locked = PermissionError(13, "manifest remains locked")
+            locked.winerror = 5
+
+            with (
+                patch(
+                    "app.services.youtube_batch.os.replace",
+                    side_effect=locked,
+                ),
+                patch("app.services.youtube_batch.time.sleep"),
+                self.assertRaises(PermissionError),
+            ):
+                store.save(batch)
+
+            self.assertEqual(store.load(batch["batch_id"])["status"], "pending")
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(directory)))
 
     def test_manifest_has_compatible_and_durable_slots(self):
         with tempfile.TemporaryDirectory() as directory:
