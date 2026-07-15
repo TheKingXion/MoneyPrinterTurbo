@@ -504,6 +504,24 @@
     "Approved": "Approved",
     "Use interval between videos": "Use interval between videos",
     "Performance": "Performance",
-    "Redetect Hardware": "Redetect hardware"
+    "Redetect Hardware": "Redetect hardware",
+    "CPU core summary": "{physical} cores / {logical} threads",
+    "Free RAM": "Free RAM",
+    "CPU temperature": "CPU temperature",
+    "Not detected": "Not detected",
+    "Free disk": "Free disk",
+    "Encoder": "Encoder",
+    "CPU sensor": "CPU sensor",
+    "Vendor": "Vendor",
+    "Total VRAM": "Total VRAM",
+    "Free VRAM": "Free VRAM",
+    "Usage": "Usage",
+    "Temperature": "Temperature",
+    "Driver": "Driver",
+    "Source": "Source",
+    "Inventory only": "Inventory only",
+    "Process CPU": "Process CPU",
+    "Process RAM": "Process RAM",
+    "Used VRAM": "Used VRAM"
   }
 }

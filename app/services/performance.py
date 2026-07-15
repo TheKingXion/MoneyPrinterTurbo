@@ -9,10 +9,13 @@ to configure the exported ``render_slot`` and ``network_slot`` semaphores.
 from __future__ import annotations
 
 import contextvars
+import csv
 import dataclasses
 import functools
 import hashlib
+import io
 import json
+import math
 import os
 import platform
 import re
@@ -37,8 +40,10 @@ except ImportError:  # pragma: no cover - depends on the runtime environment
 P = ParamSpec("P")
 R = TypeVar("R")
 GIB = 1024**3
-_PROFILE_CACHE_VERSION = 2
-_ENCODER_PREFERENCE = ("h264_nvenc", "h264_qsv", "h264_mf", "libx264")
+_PROFILE_CACHE_VERSION = 3
+_ENCODER_PREFERENCE = (
+    "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "libx264"
+)
 _SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|authorization|password|secret|token)\s*[=:]\s*[^\s,;]+"
 )
@@ -61,13 +66,19 @@ def _ffmpeg_binary() -> str:
 
 @dataclass(frozen=True)
 class GPUInfo:
-    """A single NVIDIA adapter reported by ``nvidia-smi``."""
+    """A graphics adapter and any optional vendor telemetry available for it."""
 
     name: str
-    vram_total: int
-    vram_free: int
+    vram_total: int | None
+    vram_free: int | None
     driver_version: str
     temperature_c: float | None = None
+    vendor: str = "unknown"
+    device_id: str = ""
+    utilization_percent: float | None = None
+    vram_used: int | None = None
+    metrics_source: str | None = None
+    pci_bus_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,8 @@ class HardwareInfo:
     disk_free: int
     platform: str
     gpus: tuple[GPUInfo, ...] = ()
+    cpu_temperature_c: float | None = None
+    cpu_temperature_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,9 +214,50 @@ def _cpu_counts() -> tuple[int, int]:
     return max(1, int(physical or logical)), logical
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", "."))
+    if not match:
+        return None
+    try:
+        number = float(match.group())
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _valid_temperature(value: Any) -> float | None:
+    temperature = _optional_float(value)
+    return temperature if temperature is not None and -20 <= temperature <= 150 else None
+
+
+def _json_output(result: subprocess.CompletedProcess[str]) -> Any:
+    if result.returncode or not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gpu_vendor(*values: Any) -> str:
+    text = " ".join(str(value or "") for value in values).casefold()
+    if "ven_10de" in text or "nvidia" in text:
+        return "nvidia"
+    if "ven_1002" in text or "amd" in text or "radeon" in text or "advanced micro devices" in text:
+        return "amd"
+    if "ven_8086" in text or "intel" in text:
+        return "intel"
+    if "apple" in text:
+        return "apple"
+    return "unknown"
+
+
 def _nvidia_gpus() -> tuple[GPUInfo, ...]:
     fields = (
-        "name,memory.total,memory.free,driver_version,temperature.gpu"
+        "index,uuid,pci.bus_id,name,memory.total,memory.used,memory.free,"
+        "driver_version,temperature.gpu,utilization.gpu"
     )
     try:
         result = _run(
@@ -219,28 +273,218 @@ def _nvidia_gpus() -> tuple[GPUInfo, ...]:
     if result.returncode:
         return ()
     gpus = []
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 5:
+    for parts in csv.reader(io.StringIO(result.stdout)):
+        parts = [part.strip() for part in parts]
+        if len(parts) != 10:
             continue
-        try:
-            temperature = None if parts[4] in {"", "N/A", "[N/A]"} else float(parts[4])
-            gpus.append(
-                GPUInfo(
-                    name=parts[0],
-                    vram_total=int(float(parts[1]) * 1024**2),
-                    vram_free=int(float(parts[2]) * 1024**2),
-                    driver_version=parts[3],
-                    temperature_c=temperature,
-                )
+        total = _optional_float(parts[4])
+        used = _optional_float(parts[5])
+        free = _optional_float(parts[6])
+        gpus.append(
+            GPUInfo(
+                name=parts[3],
+                vram_total=int(total * 1024**2) if total is not None else None,
+                vram_free=int(free * 1024**2) if free is not None else None,
+                driver_version=parts[7],
+                temperature_c=_valid_temperature(parts[8]),
+                vendor="nvidia",
+                device_id=parts[1] or parts[2] or parts[0],
+                utilization_percent=_optional_float(parts[9]),
+                vram_used=int(used * 1024**2) if used is not None else None,
+                metrics_source="nvidia-smi",
+                pci_bus_id=parts[2],
             )
-        except ValueError:
-            continue
+        )
     return tuple(gpus)
 
 
-def detect_hardware(storage_path: str | os.PathLike[str] | None = None) -> HardwareInfo:
-    """Detect CPU, memory, disk, and NVIDIA resources without failing startup."""
+def _windows_gpus() -> tuple[GPUInfo, ...]:
+    script = (
+        "$g=@(Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,"
+        "DriverVersion,AdapterRAM,VideoProcessor); ConvertTo-Json -InputObject $g -Compress"
+    )
+    try:
+        data = _json_output(_run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=5.0
+        ))
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return ()
+    gpus = []
+    for item in data:
+        if not isinstance(item, dict) or not item.get("Name"):
+            continue
+        vram = _optional_float(item.get("AdapterRAM"))
+        # Win32_VideoController exposes a 32-bit field and commonly truncates
+        # dedicated memory at roughly 4 GiB. Do not present that as authoritative.
+        if vram is not None and (vram <= 0 or vram >= 4 * GIB - 16 * 1024**2):
+            vram = None
+        vendor = _gpu_vendor(item.get("PNPDeviceID"), item.get("Name"), item.get("VideoProcessor"))
+        if vendor == "intel":
+            vram = None  # Integrated Intel GPUs use shared system memory.
+        gpus.append(GPUInfo(
+            name=str(item["Name"]),
+            vram_total=max(0, int(vram)) if vram is not None else None,
+            vram_free=None,
+            driver_version=str(item.get("DriverVersion") or ""),
+            vendor=vendor,
+            device_id=str(item.get("PNPDeviceID") or item.get("Name")),
+        ))
+    return tuple(gpus)
+
+
+def _linux_gpus() -> tuple[GPUInfo, ...]:
+    try:
+        result = _run(["lspci", "-D", "-mm"], timeout=3.0)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode:
+        return ()
+    gpus = []
+    for line in result.stdout.splitlines():
+        try:
+            fields = next(csv.reader([line], delimiter=" ", skipinitialspace=True))
+        except (csv.Error, StopIteration):
+            continue
+        if len(fields) < 3 or not any(kind in fields[1].casefold() for kind in ("vga", "3d", "display")):
+            continue
+        name = " ".join(fields[2:4]).strip()
+        gpus.append(GPUInfo(
+            name, None, None, "", vendor=_gpu_vendor(name), device_id=fields[0], pci_bus_id=fields[0]
+        ))
+    return tuple(gpus)
+
+
+def _macos_gpus() -> tuple[GPUInfo, ...]:
+    try:
+        data = _json_output(_run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=8.0))
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    adapters = data.get("SPDisplaysDataType", []) if isinstance(data, dict) else []
+    return tuple(
+        GPUInfo(
+            str(item.get("sppci_model") or item.get("_name")), None, None,
+            "",
+            vendor=_gpu_vendor(item.get("spdisplays_vendor"), item.get("sppci_model")),
+            device_id=str(item.get("spdisplays_device-id") or item.get("_name") or ""),
+        )
+        for item in adapters
+        if isinstance(item, dict) and (item.get("sppci_model") or item.get("_name"))
+    )
+
+
+def _merge_gpus(inventory: tuple[GPUInfo, ...], telemetry: tuple[GPUInfo, ...]) -> tuple[GPUInfo, ...]:
+    if not inventory:
+        return telemetry
+    remaining = list(telemetry)
+    merged = []
+    for gpu in inventory:
+        gpu_bus = gpu.pci_bus_id.casefold().lstrip("0:")
+        match = next((
+            candidate for candidate in remaining
+            if (
+                gpu_bus and candidate.pci_bus_id.casefold().lstrip("0:") == gpu_bus
+            ) or candidate.name.casefold() == gpu.name.casefold()
+        ), None)
+        if match is None:
+            merged.append(gpu)
+            continue
+        remaining.remove(match)
+        merged.append(dataclasses.replace(
+            gpu,
+            vram_total=match.vram_total or gpu.vram_total,
+            vram_free=match.vram_free,
+            driver_version=match.driver_version or gpu.driver_version,
+            temperature_c=match.temperature_c,
+            utilization_percent=match.utilization_percent,
+            vram_used=match.vram_used,
+            metrics_source=match.metrics_source,
+            pci_bus_id=match.pci_bus_id or gpu.pci_bus_id,
+        ))
+    return tuple(merged + remaining)
+
+
+_hardware_probe_lock = threading.Lock()
+_hardware_probe_cache: dict[str, tuple[float, tuple[GPUInfo, ...], float | None, str | None]] = {}
+
+
+def _probe_hardware_devices(system: str, *, force: bool = False) -> tuple[tuple[GPUInfo, ...], float | None, str | None]:
+    with _hardware_probe_lock:
+        cached = _hardware_probe_cache.get(system)
+        if cached and not force and time.monotonic() - cached[0] < 10.0:
+            return cached[1], cached[2], cached[3]
+        inventory = (
+            _windows_gpus() if system == "Windows" else
+            _linux_gpus() if system == "Linux" else
+            _macos_gpus() if system == "Darwin" else ()
+        )
+        gpus = _merge_gpus(inventory, _nvidia_gpus())
+        cpu_temperature, temperature_source = _cpu_temperature()
+        _hardware_probe_cache[system] = (
+            time.monotonic(), gpus, cpu_temperature, temperature_source
+        )
+        return gpus, cpu_temperature, temperature_source
+
+
+def _cpu_temperature() -> tuple[float | None, str | None]:
+    if _psutil is not None and hasattr(_psutil, "sensors_temperatures"):
+        try:
+            sensors = _psutil.sensors_temperatures(fahrenheit=False) or {}
+            preferred = []
+            fallback = []
+            for chip, entries in sensors.items():
+                if chip.casefold() not in {"coretemp", "k10temp", "zenpower", "cpu_thermal"}:
+                    continue
+                for entry in entries:
+                    temperature = _valid_temperature(getattr(entry, "current", None))
+                    if temperature is None:
+                        continue
+                    label = str(getattr(entry, "label", "") or "").casefold()
+                    target = preferred if any(name in label for name in ("package", "physical", "tdie", "tctl")) else fallback
+                    target.append(temperature)
+            values = preferred or fallback
+            if values:
+                return max(values), "psutil"
+        except (AttributeError, OSError, RuntimeError, TypeError):
+            pass
+    if platform.system() != "Windows":
+        return None, None
+    script = (
+        "$n=@('root/LibreHardwareMonitor','root/OpenHardwareMonitor');$r=@();"
+        "foreach($x in $n){try{$r+=@(Get-CimInstance -Namespace $x -ClassName Sensor -ErrorAction Stop|"
+        "Where-Object {$_.SensorType -eq 'Temperature' -and ($_.Identifier -match 'cpu' -or $_.Parent -match 'cpu')}|"
+        "Select-Object Name,Value,@{n='Source';e={$x}})}catch{}};ConvertTo-Json -InputObject $r -Compress"
+    )
+    try:
+        data = _json_output(_run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=5.0
+        ))
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if isinstance(data, dict):
+        data = [data]
+    readings = []
+    for item in data if isinstance(data, list) else []:
+        temperature = _valid_temperature(item.get("Value")) if isinstance(item, dict) else None
+        if temperature is not None:
+            name = str(item.get("Name") or "").casefold()
+            priority = 0 if any(key in name for key in ("package", "tdie", "tctl")) else 1
+            readings.append((priority, temperature, str(item.get("Source") or "hardware monitor")))
+    if not readings:
+        return None, None
+    best_priority = min(item[0] for item in readings)
+    candidates = [item for item in readings if item[0] == best_priority]
+    _, temperature, source = max(candidates, key=lambda item: item[1])
+    return temperature, source
+
+
+def detect_hardware(
+    storage_path: str | os.PathLike[str] | None = None, *, force: bool = False
+) -> HardwareInfo:
+    """Detect host resources without requiring vendor-specific GPU utilities."""
 
     base = Path(storage_path or _storage_dir()).resolve()
     try:
@@ -249,6 +493,8 @@ def detect_hardware(storage_path: str | os.PathLike[str] | None = None) -> Hardw
         disk = shutil.disk_usage(base.anchor or os.curdir)
     physical, logical = _cpu_counts()
     ram_total, ram_available = _memory()
+    system = platform.system()
+    gpus, cpu_temperature, temperature_source = _probe_hardware_devices(system, force=force)
     return HardwareInfo(
         cpu_physical=physical,
         cpu_logical=logical,
@@ -256,8 +502,10 @@ def detect_hardware(storage_path: str | os.PathLike[str] | None = None) -> Hardw
         ram_available=ram_available,
         disk_total=int(disk.total),
         disk_free=int(disk.free),
-        platform=f"{platform.system()}-{platform.machine()}",
-        gpus=_nvidia_gpus(),
+        platform=f"{system}-{platform.machine()}",
+        gpus=gpus,
+        cpu_temperature_c=cpu_temperature,
+        cpu_temperature_source=temperature_source,
     )
 
 
@@ -365,8 +613,14 @@ def derive_profile(
     cpu_limit = max(1, hardware.cpu_physical // 2)
     memory_limit = max(1, int(available_gib // 3))
     render_slots = min(4, cpu_limit, memory_limit)
-    if codec == "h264_nvenc" and hardware.gpus:
-        total_vram = sum(gpu.vram_total for gpu in hardware.gpus)
+    gpu_codec_vendor = {"h264_nvenc": "nvidia", "h264_amf": "amd"}
+    codec_vendor = gpu_codec_vendor.get(codec)
+    matching_vram = [
+        gpu.vram_total for gpu in hardware.gpus
+        if gpu.vendor == codec_vendor and gpu.vram_total
+    ]
+    if matching_vram:
+        total_vram = sum(matching_vram)
         gpu_limit = 1 if total_vram <= 6 * GIB else 2 if total_vram <= 12 * GIB else 3
         render_slots = min(render_slots, gpu_limit)
     disk_low_threshold = max(5 * GIB, int(hardware.disk_total * 0.05))
@@ -410,7 +664,7 @@ def get_performance_profile(
 
     storage = Path(storage_path or _storage_dir()).resolve()
     storage.mkdir(parents=True, exist_ok=True)
-    hardware = detect_hardware(storage)
+    hardware = detect_hardware(storage, force=force)
     ffmpeg = inspect_ffmpeg()
     fingerprint = hardware_fingerprint(hardware, ffmpeg)
     cache_path = storage / "performance_profile.json"
