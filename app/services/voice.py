@@ -13,7 +13,7 @@ import time
 import unicodedata
 from datetime import datetime
 from typing import Union
-from xml.sax.saxutils import escape, unescape
+from xml.sax.saxutils import escape, quoteattr, unescape
 
 import edge_tts
 import requests
@@ -374,12 +374,7 @@ def tts(
         )
 
     if is_azure_v2_voice(voice_name):
-        return azure_tts_v2(
-            text,
-            voice_name,
-            voice_file,
-            voice_rate=voice_rate,
-        )
+        return azure_tts_v2(text, voice_name, voice_rate, voice_file)
     elif is_siliconflow_voice(voice_name):
         # 从voice_name中提取模型和声音
         # 格式: siliconflow:model:voice-Gender
@@ -919,43 +914,27 @@ def siliconflow_tts(
     return None
 
 
-def _build_azure_v2_ssml(text: str, voice_name: str, voice_rate: float) -> str:
-    """构造 Azure Speech V2 使用的 SSML，并安全规范化语速参数。"""
-    try:
-        normalized_rate = float(voice_rate)
-    except (TypeError, ValueError):
-        normalized_rate = 1.0
-    normalized_rate = max(0.25, min(4.0, normalized_rate))
-
-    voice_locale_parts = voice_name.split("-", 2)
-    voice_locale = (
-        "-".join(voice_locale_parts[:2])
-        if len(voice_locale_parts) >= 2
-        else "en-US"
-    )
-    escaped_text = escape(text)
-    escaped_voice_name = escape(voice_name, {'"': "&quot;"})
+def _build_azure_ssml(text: str, voice_name: str, voice_rate: float) -> str:
+    language = "-".join(voice_name.split("-")[:2]) or "en-US"
     return (
-        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-        f'xml:lang="{voice_locale}">'
-        f'<voice name="{escaped_voice_name}">'
-        f'<prosody rate="{normalized_rate:g}">{escaped_text}</prosody>'
-        "</voice></speak>"
+        f"<speak version='1.0' xml:lang={quoteattr(language)}>"
+        f"<voice name={quoteattr(voice_name)}>"
+        f"<prosody rate={quoteattr(convert_rate_to_percent(voice_rate))}>"
+        f"{escape(text)}</prosody></voice></speak>"
     )
 
 
 def azure_tts_v2(
-    text: str,
-    voice_name: str,
-    voice_file: str,
-    voice_rate: float = 1.0,
+    text: str, voice_name: str, voice_rate: float, voice_file: str
 ) -> Union[SubMaker, None]:
     voice_name = is_azure_v2_voice(voice_name)
     if not voice_name:
         logger.error(f"invalid voice name: {voice_name}")
         raise ValueError(f"invalid voice name: {voice_name}")
     text = text.strip()
-    ssml = _build_azure_v2_ssml(text, voice_name, voice_rate)
+    if not text:
+        logger.error("Azure TTS V2 text is empty")
+        return None
 
     def _format_duration_to_offset(duration) -> int:
         if isinstance(duration, str):
@@ -975,9 +954,7 @@ def azure_tts_v2(
 
     for i in range(3):
         try:
-            logger.info(
-                f"start, voice name: {voice_name}, rate: {voice_rate}, try: {i + 1}"
-            )
+            logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
 
             import azure.cognitiveservices.speech as speechsdk
 
@@ -1004,6 +981,7 @@ def azure_tts_v2(
                 logger.error("Azure speech key or region is not set")
                 return None
 
+            ensure_file_path_exists(voice_file)
             audio_config = speechsdk.audio.AudioOutputConfig(
                 filename=voice_file, use_default_speaker=True
             )
@@ -1028,8 +1006,7 @@ def azure_tts_v2(
                 speech_synthesizer_word_boundary_cb
             )
 
-            # speak_text_async() 不支持语速参数。使用 SSML prosody 后，试听和
-            # 正式生成都会按 WebUI/API 传入的 voice_rate 调整语速。
+            ssml = _build_azure_ssml(text, voice_name, voice_rate)
             result = speech_synthesizer.speak_ssml_async(ssml).get()
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                 logger.success(f"azure v2 speech synthesis succeeded: {voice_file}")
@@ -1069,11 +1046,10 @@ def gemini_tts(
     Returns:
         SubMaker对象或None
     """
-    import base64
-    import io
-    from pydub import AudioSegment
     from google import genai
     from google.genai import types
+    from pydub import AudioSegment
+
     _configure_pydub_ffmpeg(AudioSegment)
     
     try:
@@ -1082,28 +1058,30 @@ def gemini_tts(
             logger.error("Gemini API key is not set")
             return None
 
-        logger.info(f"start, voice name: {voice_name}, try: 1")
+        text = (text or "").strip()
+        if not text:
+            logger.error("Gemini TTS text is empty")
+            return None
 
-        generation_config = types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice_name
+        logger.info(f"start, voice name: {voice_name}, try: 1")
+        ensure_file_path_exists(voice_file)
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
                     )
-                )
+                ),
             ),
         )
-
-        # google-genai 使用统一 Client 调用文本和 TTS 模型。上下文管理器确保
-        # 请求结束后释放 HTTP 连接，同时保留原有 PCM 转码和字幕时间轴逻辑。
-        with genai.Client(api_key=api_key) as client:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=text,
-                config=generation_config,
-            )
-
+        
         # 检查响应
         if not response.candidates or not response.candidates[0].content:
             logger.error("No audio content received from Gemini TTS")
@@ -1128,9 +1106,6 @@ def gemini_tts(
             # 如果已经是字节，直接使用
             audio_bytes = audio_data
         
-        # 尝试不同的音频格式 - Gemini可能返回不同的格式
-        audio_segment = None
-        
         # Gemini返回Linear PCM格式，按照文档参数解析
         try:
             audio_segment = AudioSegment.from_file(
@@ -1144,15 +1119,8 @@ def gemini_tts(
             logger.error(f"Failed to load PCM audio: {e}")
             return None
         
-        # API、CLI 或测试可以直接把尚不存在的嵌套目录作为输出位置。这里在
-        # 真正写文件前统一创建父目录，避免一次成功的 Gemini 请求最后因为
-        # 本地路径不存在而丢失结果，也让该 provider 与其他 TTS 实现行为一致。
-        ensure_file_path_exists(voice_file)
-
-        # pydub 会返回打开的输出文件对象。批量生成时若不主动关闭，文件描述符
-        # 会持续累积，并在 Windows 上增加后续覆盖或删除音频文件失败的概率。
-        exported_audio = audio_segment.export(voice_file, format="mp3")
-        exported_audio.close()
+        # 导出为MP3格式
+        audio_segment.export(voice_file, format="mp3")
         
         logger.info(f"completed, output file: {voice_file}")
         
@@ -1168,7 +1136,10 @@ def gemini_tts(
         )
         
     except ImportError as e:
-        logger.error(f"Missing required package for Gemini TTS: {str(e)}. Please install: pip install pydub")
+        logger.error(
+            "Missing required package for Gemini TTS: "
+            f"{str(e)}. Please install: pip install google-genai pydub"
+        )
         return None
     except Exception as e:
         logger.error(f"Gemini TTS failed, error: {str(e)}")
@@ -1718,14 +1689,13 @@ def _get_audio_duration_from_submaker(sub_maker: SubMaker):
 
 def _get_audio_duration_from_file(audio_file: str) -> float:
     """
-    获取音频文件时长（支持 mp3/m4a/wav/aac 等 ffmpeg 可解码的格式）
+    获取音频文件时长
     """
-    if not os.path.exists(audio_file):
-        logger.error(f"audio file does not exist: {audio_file}")
+    if not os.path.isfile(audio_file):
+        logger.error(f"Audio file does not exist: {audio_file}")
         return 0.0
 
     try:
-        # Use moviepy (ffmpeg) to read the duration of any supported audio format
         with AudioFileClip(audio_file) as audio:
             return audio.duration  # Duration in seconds
     except Exception as e:
@@ -1736,7 +1706,7 @@ def get_audio_duration(target: Union[str, SubMaker]) -> float:
     """
     获取音频时长
     如果是SubMaker对象，则从SubMaker中获取时长
-    如果是音频文件路径，则从音频文件中获取时长（支持 mp3/m4a/wav 等格式）
+    如果是音频文件路径，则从文件中获取时长
     """
     if isinstance(target, SubMaker):
         return _get_audio_duration_from_submaker(target)
@@ -1804,7 +1774,10 @@ if __name__ == "__main__":
             voice_file = f"{temp_dir}/tts-{voice_name}.mp3"
             subtitle_file = f"{temp_dir}/tts.mp3.srt"
             sub_maker = azure_tts_v2(
-                text=text, voice_name=voice_name, voice_file=voice_file
+                text=text,
+                voice_name=voice_name,
+                voice_rate=1.0,
+                voice_file=voice_file,
             )
             create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
             audio_duration = get_audio_duration(sub_maker)

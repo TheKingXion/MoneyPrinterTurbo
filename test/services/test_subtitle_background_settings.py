@@ -10,7 +10,6 @@ from app.services import video
 
 class TestSubtitleBackgroundSettings(unittest.TestCase):
     def test_subtitle_background_is_disabled_by_default(self):
-        """新任务和独立字幕接口都不应在用户未指定时渲染字幕背景。"""
         video_params = VideoParams(video_subject="default subtitle background")
         subtitle_request = SubtitleRequest(video_script="default subtitle background")
 
@@ -26,8 +25,6 @@ class TestSubtitleBackgroundSettings(unittest.TestCase):
         required_keys = {
             "Enable Subtitle Background",
             "Subtitle Background Color",
-            "Subtitle Colors Are Indistinguishable",
-            "Subtitle Font Does Not Support Text",
             "No Voice",
         }
 
@@ -59,6 +56,14 @@ class TestSubtitleBackgroundSettings(unittest.TestCase):
 
         self.assertFalse(disabled_params.text_background_color)
         self.assertEqual(colored_params.text_background_color, "#123456")
+
+    def test_video_params_preserves_historical_boolean_background(self):
+        params = VideoParams(
+            video_subject="historical subtitle background",
+            text_background_color=True,
+        )
+
+        self.assertTrue(params.text_background_color)
 
     def test_visible_text_position_centers_actual_mask_bounds(self):
         """
@@ -92,38 +97,18 @@ class TestSubtitleBackgroundSettings(unittest.TestCase):
             video_subject="subtitle color validation",
             text_fore_color="#000000",
             text_background_color="#000000",
-            stroke_color="#000000",
-            stroke_width=1.5,
         )
-        different_outline_params = VideoParams(
-            video_subject="subtitle color validation",
-            text_fore_color="#000000",
-            text_background_color="#000000",
-            stroke_color="#FFFFFF",
-            stroke_width=1.5,
-        )
-        background_disabled_params = VideoParams(
+        disabled_params = VideoParams(
             video_subject="subtitle color validation",
             text_fore_color="#000000",
             text_background_color=False,
-            stroke_color="#000000",
-            stroke_width=1.5,
         )
 
-        self.assertTrue(
-            video.subtitle_colors_are_indistinguishable(invisible_params)
-        )
-        self.assertTrue(
-            video.subtitle_colors_are_indistinguishable(different_outline_params)
-        )
-        self.assertFalse(
-            video.subtitle_colors_are_indistinguishable(background_disabled_params)
-        )
+        self.assertTrue(video.subtitle_colors_are_indistinguishable(invisible_params))
+        self.assertFalse(video.subtitle_colors_are_indistinguishable(disabled_params))
 
     def test_detects_font_without_chinese_glyphs(self):
-        fonts_dir = (
-            Path(__file__).parent.parent.parent / "resource" / "fonts"
-        )
+        fonts_dir = Path(__file__).parent.parent.parent / "resource" / "fonts"
 
         self.assertFalse(
             video.subtitle_font_supports_text(

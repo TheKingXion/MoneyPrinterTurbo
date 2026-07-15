@@ -4,6 +4,7 @@ import sys
 from loguru import logger
 
 from app.config import config
+from app.utils import utils
 
 
 def __init_logger():

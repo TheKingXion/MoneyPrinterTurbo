@@ -1,0 +1,72 @@
+2026-07-03 16:55:23.275 Uvicorn server started on 127.0.0.1:8501
+2026-07-03 16:55:24.041 | INFO     | app.config.config:load_config:138 - load config from file: C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main/config.toml
+2026-07-03 16:55:24.042 | INFO     | app.config.config:<module>:203 - MoneyPrinterTurbo v1.3.0
+2026-07-03 18:02:29.189 Please replace `st.components.v1.html` with `st.iframe`.
+
+`st.components.v1.html` will be removed after 2026-06-01.
+2026-07-03 18:03:31.566 Please replace `st.components.v1.html` with `st.iframe`.
+
+`st.components.v1.html` will be removed after 2026-06-01.
+--- Logging error in Loguru Handler #10 ---
+Record was: {'elapsed': datetime.timedelta(seconds=4183, microseconds=548390), 'exception': None, 'extra': {}, 'file': (name='video.py', path='./app\\services\\video.py'), 'function': 'generate_video', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 995, 'message': '  \u2460 video: .\\storage\\tasks\\4cc966b0-ef96-4fbd-89f0-32e3455dcf73\\combined-1.mp4', 'module': 'video', 'name': 'app.services.video', 'process': (id=43088, name='MainProcess'), 'thread': (id=46516, name='ScriptRunner.scriptThread'), 'time': datetime(2026, 7, 3, 18, 5, 7, 586866, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=72000), 'Hora est. Sudamérica Pacífico'))}
+Traceback (most recent call last):
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_handler.py", line 206, in emit
+    self._sink.write(str_record)
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+  File "C:\Users\Xion\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2460' in position 109: character maps to <undefined>
+--- End of logging error ---
+--- Logging error in Loguru Handler #10 ---
+Record was: {'elapsed': datetime.timedelta(seconds=4183, microseconds=553525), 'exception': None, 'extra': {}, 'file': (name='video.py', path='./app\\services\\video.py'), 'function': 'generate_video', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 996, 'message': '  \u2461 audio: .\\storage\\tasks\\4cc966b0-ef96-4fbd-89f0-32e3455dcf73\\audio.mp3', 'module': 'video', 'name': 'app.services.video', 'process': (id=43088, name='MainProcess'), 'thread': (id=46516, name='ScriptRunner.scriptThread'), 'time': datetime(2026, 7, 3, 18, 5, 7, 592001, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=72000), 'Hora est. Sudamérica Pacífico'))}
+Traceback (most recent call last):
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_handler.py", line 206, in emit
+    self._sink.write(str_record)
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+  File "C:\Users\Xion\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2461' in position 109: character maps to <undefined>
+--- End of logging error ---
+--- Logging error in Loguru Handler #10 ---
+Record was: {'elapsed': datetime.timedelta(seconds=4183, microseconds=557271), 'exception': None, 'extra': {}, 'file': (name='video.py', path='./app\\services\\video.py'), 'function': 'generate_video', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 997, 'message': '  \u2462 subtitle: .\\storage\\tasks\\4cc966b0-ef96-4fbd-89f0-32e3455dcf73\\subtitle.srt', 'module': 'video', 'name': 'app.services.video', 'process': (id=43088, name='MainProcess'), 'thread': (id=46516, name='ScriptRunner.scriptThread'), 'time': datetime(2026, 7, 3, 18, 5, 7, 595747, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=72000), 'Hora est. Sudamérica Pacífico'))}
+Traceback (most recent call last):
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_handler.py", line 206, in emit
+    self._sink.write(str_record)
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+  File "C:\Users\Xion\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2462' in position 109: character maps to <undefined>
+--- End of logging error ---
+--- Logging error in Loguru Handler #10 ---
+Record was: {'elapsed': datetime.timedelta(seconds=4183, microseconds=561356), 'exception': None, 'extra': {}, 'file': (name='video.py', path='./app\\services\\video.py'), 'function': 'generate_video', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 998, 'message': '  \u2463 output: .\\storage\\tasks\\4cc966b0-ef96-4fbd-89f0-32e3455dcf73\\final-1.mp4', 'module': 'video', 'name': 'app.services.video', 'process': (id=43088, name='MainProcess'), 'thread': (id=46516, name='ScriptRunner.scriptThread'), 'time': datetime(2026, 7, 3, 18, 5, 7, 599832, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=72000), 'Hora est. Sudamérica Pacífico'))}
+Traceback (most recent call last):
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_handler.py", line 206, in emit
+    self._sink.write(str_record)
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+  File "C:\Users\Xion\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2463' in position 109: character maps to <undefined>
+--- End of logging error ---
+--- Logging error in Loguru Handler #10 ---
+Record was: {'elapsed': datetime.timedelta(seconds=4183, microseconds=564975), 'exception': None, 'extra': {}, 'file': (name='video.py', path='./app\\services\\video.py'), 'function': 'generate_video', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 1013, 'message': '  \u2464 font: C:/Users/Xion/Downloads/MoneyPrinterTurbo-main/MoneyPrinterTurbo-main/resource/fonts/MicrosoftYaHeiBold.ttc', 'module': 'video', 'name': 'app.services.video', 'process': (id=43088, name='MainProcess'), 'thread': (id=46516, name='ScriptRunner.scriptThread'), 'time': datetime(2026, 7, 3, 18, 5, 7, 603451, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=72000), 'Hora est. Sudamérica Pacífico'))}
+Traceback (most recent call last):
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_handler.py", line 206, in emit
+    self._sink.write(str_record)
+  File "C:\Users\Xion\Downloads\MoneyPrinterTurbo-main\MoneyPrinterTurbo-main\.venv\Lib\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+  File "C:\Users\Xion\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2464' in position 110: character maps to <undefined>
+--- End of logging error ---
+2026-07-03 18:09:45.382 Please replace `st.components.v1.html` with `st.iframe`.
+
+`st.components.v1.html` will be removed after 2026-06-01.

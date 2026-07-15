@@ -25,9 +25,6 @@ class TaskManager:
                 logger.info(
                     f"add task: {func.__name__}, current_tasks: {self.current_tasks}"
                 )
-                # 在线程启动前先预占并发名额。原实现在线程内部递增，连续请求
-                # 可能都在子线程获得锁之前看到 current_tasks=0，从而突破并发
-                # 上限。启动失败时回滚名额，让后续请求仍可正常调度。
                 self.current_tasks += 1
                 try:
                     self.execute_task(func, *args, **kwargs)
@@ -60,6 +57,8 @@ class TaskManager:
     def run_task(self, func: Callable, *args: Any, **kwargs: Any):
         try:
             func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
+        except Exception:
+            logger.exception(f"task failed: {func.__name__}")
         finally:
             self.task_done()
 
@@ -73,14 +72,11 @@ class TaskManager:
                 func = task_info["func"]
                 args = task_info.get("args", ())
                 kwargs = task_info.get("kwargs", {})
-                # 与直接创建任务保持同一计数时机，避免刚出队的任务尚未在线程
-                # 内计数时，又有新请求绕过队列占用同一个并发名额。
                 self.current_tasks += 1
                 try:
                     self.execute_task(func, *args, **kwargs)
                 except Exception:
                     self.current_tasks -= 1
-                    self.enqueue(task_info)
                     raise
 
     def task_done(self):

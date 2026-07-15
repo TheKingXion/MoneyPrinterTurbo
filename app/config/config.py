@@ -17,7 +17,7 @@ _MISSING = object()
 
 
 class _SynchronizedConfig(dict):
-    """保持 dict 使用方式不变，同时让运行期配置写操作服从同一把锁。"""
+    """Keep runtime config mutations synchronized with atomic saves."""
 
     def __setitem__(self, key, value):
         with _config_save_lock:
@@ -48,12 +48,7 @@ class _SynchronizedConfig(dict):
 
 @contextmanager
 def runtime_config_lock():
-    """
-    在一次依赖全局配置的完整操作期间阻止其它 WebUI 会话改写配置。
-
-    当前项目默认绑定本地回环地址，配置仍然是单用户全局配置。这个轻量锁主要
-    保护生成、试听等长操作，避免另一个标签页在操作中途切换 Provider 或密钥。
-    """
+    """Prevent other sessions from changing global config during an operation."""
     with _config_save_lock:
         yield
 
@@ -195,16 +190,7 @@ def load_config():
 
 
 def save_config():
-    """
-    原子保存运行时配置。
-
-    Streamlit 的不同会话可能在相近时间触发配置保存。直接覆盖 config.toml 时，
-    另一个线程可能读取到只写了一部分的 TOML 内容。这里使用进程内可重入锁串行化
-    保存，并先写入同目录临时文件，再通过 os.replace 原子替换目标文件。
-
-    这仍然保留项目现有的单用户全局配置语义，不额外引入复杂的多用户配置系统；
-    主要用于避免多标签页或快速 rerun 时损坏配置文件。
-    """
+    """Synchronize and atomically persist all runtime-managed config sections."""
     with _config_save_lock:
         config_to_save = dict(_cfg)
         config_to_save["app"] = dict(app)
@@ -212,11 +198,11 @@ def save_config():
         config_to_save["siliconflow"] = dict(siliconflow)
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
+        config_to_save["youtube"] = dict(youtube)
+        config_to_save["tiktok"] = dict(tiktok)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
-        # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
-        # 点击普通控件都产生一次磁盘写入和 fsync。
         try:
             with open(config_file, mode="r", encoding="utf-8") as f:
                 if f.read() == serialized_config:
@@ -253,32 +239,79 @@ azure = _SynchronizedConfig(_cfg.get("azure", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
-ui = _SynchronizedConfig(
-    _cfg.get(
-        "ui",
-        {
-            "hide_log": False,
-        },
-    )
-)
+youtube = _SynchronizedConfig({
+    "enabled": False,
+    "auto_upload": False,
+    "privacy_status": "private",
+    "schedule_enabled": False,
+    "schedule_at": "21:00",
+    "schedule_mode": "interval",
+    "schedule_videos_per_day": 4,
+    "schedule_timezone": "local",
+    "schedule_interval_minutes": 15,
+    "daily_api_limit": 7,
+    "upload_interval_minutes": 5,
+    "client_id": "",
+    "client_secret": "",
+    "allow_remote_api": False,
+    **_cfg.get("youtube", {}),
+})
+tiktok = _SynchronizedConfig({
+    "enabled": False,
+    "provider": "official",
+    "auto_upload": False,
+    "client_key": "",
+    "client_secret": "",
+    "redirect_uri": "http://127.0.0.1:8080/api/v1/tiktok/callback",
+    "privacy_level": "SELF_ONLY",
+    "allow_comments": True,
+    "allow_duet": False,
+    "allow_stitch": False,
+    "schedule_enabled": False,
+    "schedule_at": "21:00",
+    "schedule_interval_minutes": 30,
+    "upload_interval_minutes": 5,
+    "daily_upload_limit": 10,
+    "max_retries": 3,
+    "retry_delay_minutes": 10,
+    "upload_post_api_key": "",
+    "upload_post_username": "",
+    "allow_remote_api": False,
+    **_cfg.get("tiktok", {}),
+})
+if os.getenv("TIKTOK_CLIENT_KEY"):
+    tiktok["client_key"] = os.environ["TIKTOK_CLIENT_KEY"]
+if os.getenv("TIKTOK_CLIENT_SECRET"):
+    tiktok["client_secret"] = os.environ["TIKTOK_CLIENT_SECRET"]
+ui = _SynchronizedConfig(_cfg.get(
+    "ui",
+    {
+        "hide_log": False,
+    },
+))
 
 hostname = socket.gethostname()
 
 log_level = _cfg.get("log_level", "DEBUG")
-listen_host = _cfg.get("listen_host", "0.0.0.0")
+listen_host = _cfg.get("listen_host", "127.0.0.1")
 listen_port = _cfg.get("listen_port", 8080)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
 project_description = _cfg.get(
     "project_description",
-    "<a href='https://github.com/harry0703/MoneyPrinterTurbo'>https://github.com/harry0703/MoneyPrinterTurbo</a>",
+    "<a href='https://github.com/harry0703/MoneyPrinterTurbo'>https://github.com/harry0703/MoneyPrinterTurbo</a>"
+    "<br><small>Supported by <a href='https://aihubmix.com/?aff=CEve'>AIHubMix</a></small>",
 )
-project_version = _cfg.get("project_version", "1.3.2")
+project_version = "1.3.2+custom.1"
 reload_debug = False
 
 app["redis_host"] = os.getenv(
     "MPT_APP_REDIS_HOST",
     os.getenv("REDIS_HOST", app.get("redis_host", "localhost")),
 )
+
+imagemagick_path = app.get("imagemagick_path", "")
+if imagemagick_path and os.path.isfile(imagemagick_path):
+    os.environ["IMAGEMAGICK_BINARY"] = imagemagick_path
 
 ffmpeg_path = app.get("ffmpeg_path", "")
 if ffmpeg_path and os.path.isfile(ffmpeg_path):

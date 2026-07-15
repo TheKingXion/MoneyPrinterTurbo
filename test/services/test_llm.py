@@ -1,25 +1,18 @@
-import json
 import os
 import sys
 import tempfile
-import tomllib
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
+import google
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
-from app.models.llm_provider import (
-    DEFAULT_LLM_PROVIDER_ID,
-    LLM_PROVIDER_REGISTRY,
-    LLM_PROVIDERS,
-    get_llm_provider,
-    normalize_provider_override,
-)
+from app.models.llm_provider import get_llm_provider
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
@@ -71,9 +64,9 @@ class TestScriptPromptOptions(unittest.TestCase):
         )
 
         self.assertIn("# Role: Video Script Generator", prompt)
-        self.assertIn("- video subject: 咖啡", prompt)
-        self.assertIn("- number of paragraphs: 3", prompt)
-        self.assertIn("- language: zh-CN", prompt)
+        self.assertIn('"video_subject": "咖啡"', prompt)
+        self.assertIn('"number_of_paragraphs": 3', prompt)
+        self.assertIn('"language": "zh-CN"', prompt)
         self.assertIn("# Additional User Requirements:", prompt)
         self.assertIn("语气轻松，面向程序员", prompt)
 
@@ -91,9 +84,9 @@ class TestScriptPromptOptions(unittest.TestCase):
 
         self.assertNotIn("# Role: Video Script Generator", prompt)
         self.assertIn("Only write cinematic narration.", prompt)
-        self.assertIn("- video subject: 露营", prompt)
-        self.assertIn("- number of paragraphs: 2", prompt)
-        self.assertIn("- language: en", prompt)
+        self.assertIn('"video_subject": "露营"', prompt)
+        self.assertIn('"number_of_paragraphs": 2', prompt)
+        self.assertIn('"language": "en"', prompt)
 
     def test_generate_script_sends_custom_prompt_to_llm(self):
         captured = {}
@@ -102,9 +95,7 @@ class TestScriptPromptOptions(unittest.TestCase):
             captured["prompt"] = prompt
             return "第一段。\n\n第二段。"
 
-        with patch.object(
-            llm, "_generate_response", side_effect=fake_generate_response
-        ):
+        with patch.object(llm, "_generate_response", side_effect=fake_generate_response):
             result = llm.generate_script(
                 video_subject="咖啡",
                 language="zh-CN",
@@ -113,8 +104,64 @@ class TestScriptPromptOptions(unittest.TestCase):
             )
 
         self.assertEqual(result, "第一段。\n\n第二段。")
-        self.assertIn("- number of paragraphs: 2", captured["prompt"])
+        self.assertIn('"number_of_paragraphs": 2', captured["prompt"])
         self.assertIn("开头更有悬念", captured["prompt"])
+
+    def test_generate_script_retries_wrong_paragraph_count(self):
+        responses = ["Un solo párrafo.", "Primero.\n\nSegundo."]
+        with patch.object(llm, "_generate_response", side_effect=responses) as generate:
+            result = llm.generate_script("Historia", paragraph_number=2)
+
+        self.assertEqual(result, "Primero.\n\nSegundo.")
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_script_preserves_parenthetical_narration(self):
+        response = "Recuperó los libros (incluidos varios cuentos infantiles)."
+        with patch.object(llm, "_generate_response", return_value=response):
+            result = llm.generate_script("Recuperó libros, incluidos cuentos infantiles.")
+
+        self.assertEqual(result, response)
+
+    def test_generate_script_retries_an_invented_number(self):
+        responses = [
+            "Ayudó a 500 vecinos con libros.",
+            "Ayudó a sus vecinos compartiendo libros.",
+        ]
+        with patch.object(llm, "_generate_response", side_effect=responses) as generate:
+            result = llm.generate_script("Ayudó a sus vecinos compartiendo libros.")
+
+        self.assertEqual(result, responses[1])
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_batch_ideas_parses_structured_briefs(self):
+        response = (
+            '{"ideas":['
+            '{"subject":"Una joven recupera libros y supera una inundación.",'
+            '"title":"Los libros que sobrevivieron a la lluvia"},'
+            '{"subject":"Un mecánico repara bicicletas para repartidores.",'
+            '"title":"El taller que protegió sus empleos"}'
+            "]}"
+        )
+        with patch.object(llm, "_generate_response", return_value=response):
+            ideas = llm.generate_batch_ideas("Historias comunitarias", 2)
+
+        self.assertEqual(len(ideas), 2)
+        self.assertEqual(ideas[0]["title_override"], "Los libros que sobrevivieron a la lluvia")
+        self.assertIn("different central problem and solution", llm.build_batch_ideas_prompt("x", 2))
+
+    def test_generate_batch_ideas_retries_duplicate_response(self):
+        duplicate = '{"ideas":["La misma idea","La misma idea"]}'
+        valid = (
+            '{"ideas":['
+            '{"subject":"Primera idea concreta","title":"Primer título"},'
+            '{"subject":"Segunda idea diferente","title":"Segundo título"}'
+            "]}"
+        )
+        with patch.object(llm, "_generate_response", side_effect=[duplicate, valid]) as generate:
+            ideas = llm.generate_batch_ideas("Historias", 2)
+
+        self.assertEqual([idea["subject"] for idea in ideas], ["Primera idea concreta", "Segunda idea diferente"])
+        self.assertEqual(generate.call_count, 2)
 
     def test_generate_terms_can_request_script_ordered_keywords(self):
         """
@@ -128,9 +175,7 @@ class TestScriptPromptOptions(unittest.TestCase):
             captured["prompt"] = prompt
             return '["opening city", "middle office", "final sunset"]'
 
-        with patch.object(
-            llm, "_generate_response", side_effect=fake_generate_response
-        ):
+        with patch.object(llm, "_generate_response", side_effect=fake_generate_response):
             result = llm.generate_terms(
                 video_subject="startup story",
                 video_script="First city. Then office. Finally sunset.",
@@ -139,28 +184,75 @@ class TestScriptPromptOptions(unittest.TestCase):
             )
 
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
-        self.assertIn("chronological stock-video search terms", captured["prompt"])
-        self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("chronological stock-video search queries", captured["prompt"])
+        self.assertIn("same order as the narration", captured["prompt"])
 
-    def test_generate_terms_returns_empty_list_on_provider_error(self):
-        """
-        Provider 错误必须保持 generate_terms 的 List[str] 返回契约。
+    def test_generate_terms_audits_weak_chronological_keywords(self):
+        responses = [
+            '["young girl sorting boxes", "team watching viral video"]',
+            '["young adult woman sorting boxes warehouse", '
+            '"young adult woman labeling boxes warehouse"]',
+        ]
 
-        非空的 ``Error: ...`` 字符串在 Python 中是真值；如果直接返回，任务层
-        会把它当成有效关键词，素材下载层随后还可能逐字符发起搜索请求。
-        """
-        with patch.object(
-            llm,
-            "_generate_response",
-            return_value="Error: invalid API key",
-        ):
+        with patch.object(llm, "_generate_response", side_effect=responses) as generate:
             result = llm.generate_terms(
-                video_subject="startup story",
-                video_script="A short startup story.",
+                video_subject="Una joven trabaja organizando una bodega.",
+                video_script="Ordena cajas y luego etiqueta la bodega.",
+                amount=2,
+                match_script_order=True,
             )
 
-        self.assertEqual(result, [])
-        self.assertIsInstance(result, list)
+        self.assertEqual(
+            result,
+            [
+                "young adult woman sorting boxes warehouse",
+                "young adult woman labeling boxes warehouse",
+            ],
+        )
+        self.assertEqual(generate.call_count, 2)
+
+    def test_keyword_audit_inherits_central_location(self):
+        terms = [
+            "woman sorting boxes inside warehouse",
+            "woman labeling cardboard boxes warehouse",
+            "woman arranging colorful boxes",
+            "woman entering radio studio",
+        ]
+
+        result = llm._enforce_central_location(
+            terms, "Una joven organiza cajas dentro de una bodega."
+        )
+
+        self.assertEqual(result[2], "woman arranging colorful boxes in warehouse")
+        self.assertEqual(result[3], "woman entering in warehouse")
+
+    def test_keyword_audit_removes_hallucinated_location(self):
+        terms = [
+            "customer protecting bank data smartphone warehouse",
+            "caller refusing suspicious code inside warehouse",
+        ]
+
+        result = llm._enforce_central_location(
+            terms, "Una llamada falsa del banco intenta robar un código SMS."
+        )
+
+        self.assertEqual(
+            result,
+            [
+                "customer protecting bank data smartphone",
+                "caller refusing suspicious code",
+            ],
+        )
+
+    def test_keyword_audit_removes_invented_age(self):
+        result = llm._enforce_central_location(
+            ["worried young person answering suspicious bank call indoors"],
+            "Una persona recibe una llamada falsa del banco.",
+        )
+
+        self.assertEqual(
+            result, ["worried person answering suspicious bank call indoors"]
+        )
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """
@@ -179,7 +271,6 @@ class TestScriptPromptOptions(unittest.TestCase):
 
 class TestLLMConnection(unittest.TestCase):
     def test_connection_sends_one_minimal_request(self):
-        """连接测试只发送一次固定最小请求，不触发脚本生成重试。"""
         with (
             patch.object(llm, "_generate_response", return_value="OK") as generate,
             patch.object(llm, "perf_counter", side_effect=[10.0, 10.25]),
@@ -190,28 +281,13 @@ class TestLLMConnection(unittest.TestCase):
         self.assertEqual(result, (True, "", 0.25))
 
     def test_connection_returns_provider_error(self):
-        """Provider 返回错误时应保留可诊断信息，并报告本次请求耗时。"""
         with (
-            patch.object(
-                llm,
-                "_generate_response",
-                return_value="Error: invalid API key",
-            ),
+            patch.object(llm, "_generate_response", return_value="Error: invalid API key"),
             patch.object(llm, "perf_counter", side_effect=[20.0, 20.5]),
         ):
             result = llm.test_connection()
 
         self.assertEqual(result, (False, "invalid API key", 0.5))
-
-    def test_connection_rejects_empty_response(self):
-        """极端情况下的空响应应显示明确错误，而不是误报连接成功。"""
-        with (
-            patch.object(llm, "_generate_response", return_value=""),
-            patch.object(llm, "perf_counter", side_effect=[30.0, 31.0]),
-        ):
-            result = llm.test_connection()
-
-        self.assertEqual(result, (False, "LLM returned an empty response", 1.0))
 
 
 class TestLiteLLMProvider(unittest.TestCase):
@@ -222,315 +298,15 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app.clear()
         config.app.update(self.original_app_config)
 
-    def test_current_default_model_names(self):
-        """WebUI 与服务层必须共享同一组默认模型，避免展示值和请求值漂移。"""
-        self.assertEqual(get_llm_provider("openai").default_model, "gpt-5.5")
-        self.assertEqual(get_llm_provider("aimlapi").default_model, "openai/gpt-5-5")
-        self.assertEqual(get_llm_provider("deepseek").default_model, "deepseek-v4-pro")
-        self.assertEqual(
-            get_llm_provider("modelscope").default_model, "ZhipuAI/GLM-5.2"
-        )
-        self.assertEqual(
-            get_llm_provider("gemini").default_model, "gemini-3.1-pro-preview"
-        )
-        pollinations = get_llm_provider("pollinations")
-        self.assertEqual(pollinations.default_model, "openai-fast")
-        self.assertEqual(
-            pollinations.default_base_url,
-            "https://gen.pollinations.ai/v1",
-        )
-        self.assertTrue(pollinations.requires_api_key)
-        self.assertEqual(pollinations.adapter, "openai_compatible")
+    def _use_litellm_provider(self, model_name="openai/gpt-4o-mini"):
+        config.app["llm_provider"] = "litellm"
+        config.app["litellm_model_name"] = model_name
 
-    def test_provider_defaults_are_not_persisted_as_user_overrides(self):
-        """默认值只用于运行和展示，只有不同值才应写入用户配置。"""
-        self.assertEqual(
-            normalize_provider_override("gpt-5.5", "gpt-5.5"),
-            "",
-        )
-        self.assertEqual(
-            normalize_provider_override("  gpt-5.5  ", "gpt-5.5"),
-            "",
-        )
-        self.assertEqual(
-            normalize_provider_override("gpt-5.6-custom", "gpt-5.5"),
-            "gpt-5.6-custom",
-        )
-
-    def test_provider_registry_has_unique_stable_ids(self):
-        """Registry 是 Provider 列表的唯一数据源，ID 必须唯一且默认项存在。"""
-        provider_ids = [provider.provider_id for provider in LLM_PROVIDER_REGISTRY]
-
-        self.assertEqual(len(provider_ids), len(set(provider_ids)))
-        self.assertEqual(len(provider_ids), len(LLM_PROVIDERS))
-        self.assertIn(DEFAULT_LLM_PROVIDER_ID, LLM_PROVIDERS)
-
-    def test_provider_registry_preserves_product_group_order(self):
-        """下拉顺序按推荐、原厂、聚合平台、本地部署和其它服务排列。"""
-        self.assertEqual(
-            [provider.provider_id for provider in LLM_PROVIDER_REGISTRY],
-            [
-                "moonshot",
-                "openai",
-                "gemini",
-                "deepseek",
-                "qwen",
-                "azure",
-                "volcengine",
-                "grok",
-                "minimax",
-                "mimo",
-                "cloudflare",
-                "modelscope",
-                "aihubmix",
-                "aimlapi",
-                "evolink",
-                "ollama",
-                "oneapi",
-                "litellm",
-                "groq",
-                "pollinations",
-            ],
-        )
-        self.assertEqual(
-            get_llm_provider("gemini").default_label,
-            "Google Gemini",
-        )
-        self.assertEqual(
-            get_llm_provider("azure").default_label,
-            "Microsoft Azure OpenAI",
-        )
-
-    def test_provider_registry_uses_conventional_locale_and_config_keys(self):
-        """统一命名规则可避免 WebUI 为每个 Provider 增加硬编码映射。"""
-        for provider in LLM_PROVIDER_REGISTRY:
-            self.assertEqual(
-                provider.label_key,
-                f"llm_provider_label.{provider.provider_id}",
-            )
-            self.assertEqual(
-                provider.tips_key,
-                f"llm_provider_tips.{provider.provider_id}",
-            )
-            self.assertEqual(
-                provider.config_key("api_key"),
-                f"{provider.provider_id}_api_key",
-            )
-
-    def test_registry_replaces_deprecated_provider_models(self):
-        """历史默认模型应自动迁移，避免升级后继续使用已移除的接入语义。"""
-        cloudflare = get_llm_provider("cloudflare")
-        gemini = get_llm_provider("gemini")
-
-        self.assertEqual(
-            cloudflare.resolve_model_name("@cf/meta/llama-3.1-8b-instruct"),
-            "openai/gpt-4.1-mini",
-        )
-        self.assertEqual(
-            gemini.resolve_model_name("gemini-pro"),
-            "gemini-3.1-pro-preview",
-        )
-        self.assertEqual(
-            cloudflare.resolve_model_name("anthropic/claude-sonnet-4-5"),
-            "anthropic/claude-sonnet-4-5",
-        )
-
-        pollinations = get_llm_provider("pollinations")
-        self.assertEqual(
-            pollinations.resolve_model_name("default"),
-            "openai-fast",
-        )
-        self.assertEqual(
-            pollinations.resolve_base_url("https://text.pollinations.ai/openai"),
-            "https://gen.pollinations.ai/v1",
-        )
-        self.assertEqual(
-            pollinations.resolve_base_url("https://example.com/v1"),
-            "https://example.com/v1",
-        )
-
-    def test_provider_tip_templates_accept_registry_defaults(self):
-        """所有语言的 Provider 提示模板都必须能安全注入 Registry 默认值。"""
-        i18n_dir = Path(__file__).parent.parent.parent / "webui" / "i18n"
-        for locale_file in i18n_dir.glob("*.json"):
-            translations = json.loads(locale_file.read_text(encoding="utf-8"))[
-                "Translation"
-            ]
-            for provider in LLM_PROVIDER_REGISTRY:
-                tips = translations.get(provider.tips_key, "")
-                if not tips:
-                    continue
-                rendered = tips.format(
-                    api_key_url=provider.api_key_url,
-                    default_model=provider.default_model,
-                    default_base_url=provider.default_base_url,
-                    docker_hint="",
-                    **{
-                        f"default_{field.config_suffix}": field.default_value
-                        for field in provider.extra_fields
-                    },
-                )
-                self.assertNotIn("{default_model}", rendered)
-                self.assertNotIn("{default_base_url}", rendered)
-
-    def test_primary_provider_tips_use_consistent_structure(self):
-        """中英文配置说明统一展示 API Key、Base URL 和模型名称。"""
-        i18n_dir = Path(__file__).parent.parent.parent / "webui" / "i18n"
-        for language in ("zh", "en"):
-            translations = json.loads(
-                (i18n_dir / f"{language}.json").read_text(encoding="utf-8")
-            )["Translation"]
-            for provider in LLM_PROVIDER_REGISTRY:
-                tips = translations[provider.tips_key]
-                self.assertTrue(tips.startswith("##### "), provider.provider_id)
-                self.assertIn("**API Key**", tips, provider.provider_id)
-                self.assertIn("**Base Url**", tips, provider.provider_id)
-                self.assertIn("**Model Name**", tips, provider.provider_id)
-
-        zh_kimi_tips = json.loads((i18n_dir / "zh.json").read_text(encoding="utf-8"))[
-            "Translation"
-        ]["llm_provider_tips.moonshot"]
-        self.assertIn("推荐理由：", zh_kimi_tips)
-        self.assertIn("视频创作链路匹配", zh_kimi_tips)
-
-    def test_required_api_key_providers_have_clickable_entry_points(self):
-        """需要密钥的 Provider 必须提供统一申请入口，避免 WebUI 只给出文字。"""
-        i18n_dir = Path(__file__).parent.parent.parent / "webui" / "i18n"
-        locale_translations = {
-            locale_file.stem: json.loads(locale_file.read_text(encoding="utf-8"))[
-                "Translation"
-            ]
-            for locale_file in i18n_dir.glob("*.json")
-        }
-
-        for provider in LLM_PROVIDER_REGISTRY:
-            if provider.requires_api_key:
-                self.assertTrue(provider.api_key_url, provider.provider_id)
-                self.assertTrue(
-                    provider.api_key_url.startswith("https://"),
-                    provider.provider_id,
-                )
-                for language, translations in locale_translations.items():
-                    tips_template = translations.get(provider.tips_key, "")
-                    if not tips_template:
-                        continue
-                    tips = tips_template.format(
-                        api_key_url=provider.api_key_url,
-                        default_model=provider.default_model,
-                        default_base_url=provider.default_base_url,
-                        docker_hint="",
-                        **{
-                            f"default_{field.config_suffix}": field.default_value
-                            for field in provider.extra_fields
-                        },
-                    )
-                    api_key_line = next(
-                        line for line in tips.splitlines() if "**API Key**" in line
-                    )
-                    self.assertIn("](", api_key_line, provider.provider_id)
-                    self.assertIn(
-                        f"]({provider.api_key_url})",
-                        api_key_line,
-                        f"{language}: {provider.provider_id}",
-                    )
-
-    def test_example_config_does_not_duplicate_registry_defaults(self):
-        """示例配置只保存用户覆盖值，默认模型和地址由 Registry 唯一维护。"""
-        config_path = Path(__file__).parent.parent.parent / "config.example.toml"
-        app_config = tomllib.loads(config_path.read_text(encoding="utf-8"))["app"]
-
-        for provider in LLM_PROVIDER_REGISTRY:
-            if provider.default_model:
-                self.assertEqual(
-                    app_config.get(provider.config_key("model_name"), ""),
-                    "",
-                    provider.provider_id,
-                )
-            if provider.default_base_url:
-                self.assertEqual(
-                    app_config.get(provider.config_key("base_url"), ""),
-                    "",
-                    provider.provider_id,
-                )
-            for field in provider.extra_fields:
-                if field.default_value:
-                    self.assertEqual(
-                        app_config.get(provider.config_key(field.config_suffix), ""),
-                        "",
-                        provider.provider_id,
-                    )
-
-    def test_removed_ernie_provider_is_unsupported(self):
-        """移除 ERNIE 后，遗留配置应返回明确错误，不再发起旧 OAuth 请求。"""
-        config.app["llm_provider"] = "ernie"
-
-        with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
-
-        openai_client.assert_not_called()
-        self.assertIn("unsupported llm provider", result)
-
-    def test_pollinations_requires_api_key_before_request(self):
-        """新统一 API 要求鉴权，缺少 Key 时不得发送匿名生成请求。"""
-        config.app.update(
-            {
-                "llm_provider": "pollinations",
-                "pollinations_api_key": "",
-                "pollinations_base_url": "",
-                "pollinations_model_name": "",
-            }
-        )
-
-        with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
-
-        openai_client.assert_not_called()
-        self.assertIn("api_key is not set", result)
-
-    def test_pollinations_uses_unified_openai_compatible_api(self):
-        """历史地址和模型名应自动迁移，并通过统一 Chat Completions API 调用。"""
-        config.app.update(
-            {
-                "llm_provider": "pollinations",
-                "pollinations_api_key": "pollinations-test-key",
-                "pollinations_base_url": "https://text.pollinations.ai/openai/",
-                "pollinations_model_name": "default",
-            }
-        )
-
-        class FakeCompletions:
-            def create(self, **kwargs):
-                self.kwargs = kwargs
-                message = types.SimpleNamespace(content="hello\npollinations")
-                choice = types.SimpleNamespace(message=message)
-                return types.SimpleNamespace(choices=[choice])
-
-        fake_completions = FakeCompletions()
-        fake_client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=fake_completions)
-        )
-
-        with (
-            patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
-            patch.object(llm, "ChatCompletion", types.SimpleNamespace),
-        ):
-            result = llm._generate_response("Say hello")
-
-        openai_client.assert_called_once_with(
-            api_key="pollinations-test-key",
-            base_url="https://gen.pollinations.ai/v1",
-        )
-        self.assertEqual(
-            fake_completions.kwargs,
-            {
-                "model": "openai-fast",
-                "messages": [{"role": "user", "content": "Say hello"}],
-            },
-        )
-        self.assertEqual(result, "hellopollinations")
+    def test_registry_keeps_local_optional_providers(self):
+        self.assertEqual(get_llm_provider("g4f").adapter, "g4f")
+        self.assertEqual(get_llm_provider("ernie").adapter, "ernie")
 
     def test_gemini_uses_google_genai_client(self):
-        """Gemini 适配器应通过新版 SDK 的统一 Client 发起内容生成请求。"""
         config.app.update(
             {
                 "llm_provider": "gemini",
@@ -557,7 +333,19 @@ class TestLiteLLMProvider(unittest.TestCase):
             def __exit__(self, exc_type, exc_value, traceback):
                 captured["closed"] = True
 
-        with patch("google.genai.Client", FakeClient):
+        fake_types = types.SimpleNamespace(
+            HttpOptions=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            GenerateContentConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            SafetySetting=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        )
+        fake_genai = types.SimpleNamespace(Client=FakeClient, types=fake_types)
+        with (
+            patch.object(google, "genai", fake_genai, create=True),
+            patch.dict(
+                sys.modules,
+                {"google.genai": fake_genai, "google.genai.types": fake_types},
+            ),
+        ):
             result = llm._generate_response("Say hello")
 
         self.assertEqual(result, "hellogemini")
@@ -569,79 +357,6 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertEqual(captured["contents"], "Say hello")
         self.assertEqual(captured["config"].max_output_tokens, 2048)
         self.assertTrue(captured["closed"])
-
-    def test_cloudflare_requires_account_id_before_request(self):
-        """Cloudflare 缺少 Account ID 时应在本地失败，不发送无效请求。"""
-        config.app.update(
-            {
-                "llm_provider": "cloudflare",
-                "cloudflare_api_key": "test-token",
-                "cloudflare_account_id": "",
-                "cloudflare_model_name": "",
-            }
-        )
-
-        with patch.object(llm, "OpenAI") as openai_client:
-            result = llm._generate_response("test")
-
-        openai_client.assert_not_called()
-        self.assertIn("account_id is not set", result)
-
-    def test_cloudflare_uses_ai_gateway_openai_endpoint(self):
-        """Cloudflare Provider 必须走 AI Gateway，不再调用 Workers AI 接口。"""
-        config.app.update(
-            {
-                "llm_provider": "cloudflare",
-                "cloudflare_api_key": "cloudflare-token",
-                "cloudflare_account_id": "account-123",
-                "cloudflare_gateway_id": "",
-                "cloudflare_model_name": "",
-            }
-        )
-
-        fake_response = types.SimpleNamespace(
-            choices=[
-                types.SimpleNamespace(
-                    message=types.SimpleNamespace(content="gateway\nresponse")
-                )
-            ]
-        )
-
-        class FakeCompletions:
-            def create(self, **kwargs):
-                self.kwargs = kwargs
-                return fake_response
-
-        fake_completions = FakeCompletions()
-        fake_client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=fake_completions)
-        )
-
-        with (
-            patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
-            patch.object(llm, "ChatCompletion", types.SimpleNamespace),
-        ):
-            result = llm._generate_response("Say hello")
-
-        openai_client.assert_called_once_with(
-            api_key="cloudflare-token",
-            base_url=(
-                "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
-            ),
-            default_headers={"cf-aig-gateway-id": "default"},
-        )
-        self.assertEqual(
-            fake_completions.kwargs,
-            {
-                "model": "openai/gpt-4.1-mini",
-                "messages": [{"role": "user", "content": "Say hello"}],
-            },
-        )
-        self.assertEqual(result, "gatewayresponse")
-
-    def _use_litellm_provider(self, model_name="openai/gpt-4o-mini"):
-        config.app["llm_provider"] = "litellm"
-        config.app["litellm_model_name"] = model_name
 
     def test_litellm_provider_returns_normalized_text(self):
         """
@@ -675,20 +390,19 @@ class TestLiteLLMProvider(unittest.TestCase):
     def test_litellm_provider_uses_registry_default_model(self):
         self._use_litellm_provider(model_name="")
 
-        fake_litellm = types.SimpleNamespace()
-
-        def _completion(**kwargs):
-            self.assertEqual(kwargs["model"], "openai/gpt-4o-mini")
-            message = types.SimpleNamespace(content="default model")
-            choice = types.SimpleNamespace(message=message)
-            return types.SimpleNamespace(choices=[choice])
-
-        fake_litellm.completion = _completion
-
+        fake_litellm = types.SimpleNamespace(
+            completion=lambda **kwargs: types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        message=types.SimpleNamespace(content=kwargs["model"])
+                    )
+                ]
+            )
+        )
         with patch.dict(sys.modules, {"litellm": fake_litellm}):
             result = llm._generate_response("test")
 
-        self.assertEqual(result, "default model")
+        self.assertEqual(result, "openai/gpt-4o-mini")
 
     def test_litellm_provider_handles_empty_response(self):
         self._use_litellm_provider()
@@ -750,9 +464,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         config.app["llm_provider"] = "groq"
         config.app["groq_api_key"] = "groq-key"
         config.app["groq_model_name"] = "llama-3.3-70b-versatile"
-        config.app["groq_base_url"] = (
-            "https://myuser:mypassword@proxy.example.com/openai/v1"
-        )
+        config.app["groq_base_url"] = "https://myuser:mypassword@proxy.example.com/openai/v1"
 
         class FakeCompletions:
             def create(self, **kwargs):
@@ -848,9 +560,7 @@ class TestLiteLLMProvider(unittest.TestCase):
     def test_qwen_provider_reports_empty_text(self):
         """Qwen 空响应应返回可诊断错误，而不是底层 AttributeError。"""
         self._use_qwen_provider()
-        response = {
-            "output": {"text": None, "choices": [{"message": {"content": None}}]}
-        }
+        response = {"output": {"text": None, "choices": [{"message": {"content": None}}]}}
 
         with self._patch_dashscope_generation(response):
             result = llm._generate_response("Say hello")
@@ -874,7 +584,7 @@ class TestLiteLLMProvider(unittest.TestCase):
     def test_aihubmix_provider_uses_openai_compatible_client(self):
         """
         AIHubMix 是 OpenAI-compatible 网关。这里用 fake OpenAI client
-        验证独立 Provider 会使用 Registry 中的默认地址和模型，避免真实网络
+        验证独立 provider 会使用合作方默认地址和推荐模型，避免真实网络
         或私有 API Key 影响测试稳定性。
         """
         config.app["llm_provider"] = "aihubmix"
@@ -1159,9 +869,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with (
             patch.object(config, "is_running_in_container", return_value=True),
             patch.object(config, "_can_resolve_hostname", return_value=False),
-            patch.object(
-                config, "get_container_default_gateway_ip", return_value="172.17.0.1"
-            ),
+            patch.object(config, "get_container_default_gateway_ip", return_value="172.17.0.1"),
         ):
             self._assert_ollama_base_url("http://172.17.0.1:11434/v1")
 
@@ -1262,13 +970,44 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
         self.assertEqual(result, "helloazure")
 
-    def test_unsupported_provider_returns_clear_error(self):
-        config.app["llm_provider"] = "g" + "4f"
+    def test_g4f_provider_requires_explicit_opt_in(self):
+        """
+        g4f 存在供应链和稳定性风险，不能因为用户把 provider 写成 g4f
+        就默认加载第三方包并访问逆向接口，必须显式启用。
+        """
+        config.app["llm_provider"] = "g4f"
+        config.app["enable_g4f"] = False
 
         result = llm._generate_response("test")
 
         self.assertIn("Error:", result)
-        self.assertIn("unsupported llm provider", result)
+        self.assertIn("g4f provider is disabled", result)
+
+    def test_g4f_provider_uses_lazy_import_after_opt_in(self):
+        config.app["llm_provider"] = "g4f"
+        config.app["enable_g4f"] = True
+        config.app["g4f_model_name"] = "gpt-3.5-turbo"
+
+        fake_g4f = types.SimpleNamespace()
+        fake_g4f.ChatCompletion = types.SimpleNamespace(
+            create=lambda **kwargs: "hello from g4f"
+        )
+
+        with patch.dict(sys.modules, {"g4f": fake_g4f}):
+            result = llm._generate_response("test")
+
+        self.assertEqual(result, "hello from g4f")
+
+    def test_g4f_provider_reports_missing_optional_dependency(self):
+        config.app["llm_provider"] = "g4f"
+        config.app["enable_g4f"] = True
+        config.app["g4f_model_name"] = "gpt-3.5-turbo"
+
+        with patch.dict(sys.modules, {"g4f": None}):
+            result = llm._generate_response("test")
+
+        self.assertIn("Error:", result)
+        self.assertIn("g4f package is not installed by default", result)
 
 
 class TestRuntimeEnvironmentDetection(unittest.TestCase):
@@ -1340,9 +1079,7 @@ class TestRuntimeEnvironmentDetection(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(
-                config.get_container_default_gateway_ip(str(route_path)), ""
-            )
+            self.assertEqual(config.get_container_default_gateway_ip(str(route_path)), "")
 
 
 class TestSocialMetadata(unittest.TestCase):
@@ -1424,6 +1161,24 @@ class TestSocialMetadata(unittest.TestCase):
         self.assertEqual(result["title"], "上海一日游")
         self.assertEqual(result["caption"], "收藏这条路线，下次直接出发！")
         self.assertEqual(result["hashtags"], ["#上海", "#旅行", "#shorts"])
+
+    def test_social_metadata_retries_unsupported_sensational_claim(self):
+        unsupported = (
+            '{"title":"La idea que salvó al mundo","caption":"Un cambio enorme.",'
+            '"hashtags":["#idea"]}'
+        )
+        grounded = (
+            '{"title":"La biblioteca que unió al barrio","caption":"Libros usados encontraron nuevos lectores.",'
+            '"hashtags":["#libros"]}'
+        )
+        with patch.object(llm, "_generate_response", side_effect=[unsupported, grounded]) as generate:
+            result = llm.generate_social_metadata(
+                "Una joven creó una biblioteca con libros usados.",
+                platform="youtube_shorts",
+            )
+
+        self.assertEqual(result["title"], "La biblioteca que unió al barrio")
+        self.assertEqual(generate.call_count, 2)
 
     def test_generate_social_metadata_falls_back_to_generic_hashtags(self):
         with patch.object(

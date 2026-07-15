@@ -8,15 +8,11 @@ from app.services import cache_manager
 
 
 class TestVideoCacheManager(unittest.TestCase):
-    """验证缓存管理只处理受控文件，并按元数据完成轻量统计与清理。"""
-
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.cache_dir = Path(self.temp_dir.name)
         self.storage_patch = patch.object(
-            cache_manager.utils,
-            "storage_dir",
-            return_value=str(self.cache_dir),
+            cache_manager.utils, "storage_dir", return_value=str(self.cache_dir)
         )
         self.storage_patch.start()
 
@@ -31,9 +27,6 @@ class TestVideoCacheManager(unittest.TestCase):
         return path
 
     def test_stats_only_include_managed_top_level_regular_files(self):
-        """
-        未知文件、嵌套文件和符号链接可能属于用户，不能进入容量统计或清理候选。
-        """
         now = 2_000_000_000.0
         self._create_cache_file("a" * 32, 10, now - 40 * 86400)
         self._create_cache_file("b" * 32, 20, now - 2 * 86400)
@@ -41,12 +34,10 @@ class TestVideoCacheManager(unittest.TestCase):
         nested_dir = self.cache_dir / "nested"
         nested_dir.mkdir()
         (nested_dir / f"vid-{'c' * 32}.mp4").write_bytes(b"nested")
-
         symlink_path = self.cache_dir / f"vid-{'d' * 32}.mp4"
         try:
             symlink_path.symlink_to(self.cache_dir / "personal.mp4")
         except (OSError, NotImplementedError):
-            # Windows 未开启开发者模式时创建符号链接可能没有权限，不影响其余断言。
             pass
 
         with patch.object(cache_manager.time, "time", return_value=now):

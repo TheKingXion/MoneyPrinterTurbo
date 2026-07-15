@@ -1,7 +1,5 @@
-import hashlib
 import html
 import json
-import mimetypes
 import os
 import re
 import shutil
@@ -38,12 +36,11 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import bgm as bgm_service
 from app.services import cache_manager, llm, video, voice
-from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
+from webui.components import social_metadata, tiktok_panel, youtube_panel
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -208,18 +205,29 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
     return file_path
 
 
+def _resolve_ui_language(saved_language, browser_locale, supported_languages):
+    supported = list(supported_languages)
+    if saved_language in supported:
+        return saved_language
+    normalized = str(browser_locale or "").replace("_", "-").lower()
+    for language in supported:
+        if language.lower() == normalized:
+            return language
+    browser_code = normalized.split("-", 1)[0]
+    for language in supported:
+        if language.lower().split("-", 1)[0] == browser_code:
+            return language
+    system_language = utils.get_system_locale()
+    if system_language in supported:
+        return system_language
+    return "en" if "en" in supported else supported[0]
+
+
 def _initialize_session_state():
     """集中初始化跨 rerun 保留的页面状态。"""
-    if not st.session_state.get("cross_post_recovery_checked"):
-        # WebUI 可以不经过 FastAPI 独立运行，因此也需要在首次会话初始化时处理
-        # 进程重启留下的发布状态。恢复失败时不写标记，后续 rerun 会再次尝试。
-        recovered = tm.recover_interrupted_cross_posts()
-        if recovered is not None:
-            st.session_state["cross_post_recovery_checked"] = True
-
     saved_ui_language = config.ui.get("language", "")
     browser_locale = st.context.locale
-    initial_ui_language = utils.resolve_ui_language(
+    initial_ui_language = _resolve_ui_language(
         saved_language=saved_ui_language,
         browser_locale=browser_locale,
         supported_languages=locales.keys(),
@@ -255,6 +263,10 @@ def _initialize_session_state():
         "generation_log_records": [],
         # 生成按钮回调先登记任务，使顶部入口能立即显示运行中数量。
         "active_generation_tasks": {},
+        "social_title": "",
+        "social_caption": "",
+        "social_hashtags": "",
+        "social_platform": llm.DEFAULT_SOCIAL_PLATFORM,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -540,7 +552,6 @@ def _collect_task_summaries(limit=20):
             "task_id": task_id,
             "subject": subject,
             "state": task.get("state"),
-            "cross_post_state": task.get("cross_post_state"),
             "progress": int(task.get("progress", 0) or 0),
             "mtime": os.path.getmtime(task_path)
             if os.path.isdir(task_path)
@@ -618,13 +629,42 @@ def _delete_task(task_id, task_path, task_state=None):
         logger.exception(f"failed to verify task state before deletion: {task_id}, {e}")
         return False
 
-    task_snapshot = dict(current_task or {})
-    task_snapshot.setdefault("state", task_state)
-    if task_id in _active_generation_tasks():
-        task_snapshot["state"] = const.TASK_STATE_PROCESSING
-
-    if tm.is_task_busy(task_snapshot):
+    current_state = current_task.get("state") if current_task else None
+    is_processing = (
+        any(
+            _normalize_task_state(state) == const.TASK_STATE_PROCESSING
+            for state in (task_state, current_state)
+        )
+        or task_id in _active_generation_tasks()
+    )
+    if is_processing:
         logger.warning(f"refused to delete running task: {task_id}")
+        return False
+
+    try:
+        from app.services.tiktok_scheduler import tiktok_scheduler
+        from app.services.youtube_batch import youtube_batch_store
+
+        youtube_active = any(
+            item.get("task_id") == task_id
+            and (
+                item.get("generation_status") == "generating"
+                or item.get("upload_status") in {"pending", "uploading", "waiting_retry", "waiting_quota"}
+            )
+            for batch in youtube_batch_store.list_batches(10000)
+            if batch.get("status") not in {"completed", "cancelled"}
+            for item in batch.get("items", [])
+        )
+        tiktok_active = any(
+            job.get("task_id") == task_id
+            and job.get("status") in {"pending", "uploading", "scheduled_retry", "reconcile_required"}
+            for job in tiktok_scheduler.load()
+        )
+        if youtube_active or tiktok_active:
+            logger.warning(f"refused to delete task referenced by publishing queue: {task_id}")
+            return False
+    except Exception as e:
+        logger.exception(f"failed to verify publishing queues before deletion: {task_id}, {e}")
         return False
 
     tasks_root = os.path.abspath(utils.task_dir())
@@ -686,7 +726,6 @@ def _render_task_table(filtered_tasks, key_prefix):
             task_id = task["task_id"]
             has_video = bool(task["video_file"] and os.path.isfile(task["video_file"]))
             is_processing = _task_state_filter_key(task) == "processing"
-            is_busy = is_processing or tm.is_task_busy(task)
             has_restore_data = os.path.isfile(
                 os.path.join(task["task_path"], "script.json")
             )
@@ -751,7 +790,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     delete_label = tr("Delete Task")
                     delete_help = (
                         f"{delete_label} ({tr('Task Status Processing')})"
-                        if is_busy
+                        if is_processing
                         else delete_label
                     )
                     if st.button(
@@ -760,7 +799,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                         use_container_width=True,
                         icon=":material/delete:",
                         help=delete_help,
-                        disabled=is_busy,
+                        disabled=is_processing,
                     ):
                         if _delete_task(task_id, task["task_path"], task["state"]):
                             st.toast(tr("Task Deleted"))
@@ -900,8 +939,15 @@ def _apply_pending_task_restore():
     )
 
     # 视频设置。素材上传控件不能由服务端写入，因此本地素材需要用户重新选择。
-    video_source = params.get("video_source") or "pexels"
+    video_sources = params.get("video_sources") or [params.get("video_source") or "pexels"]
+    video_sources = [str(source) for source in video_sources if source]
+    video_source = video_sources[0] if video_sources else "pexels"
     _set_stable_widget_value("video_source_select", video_source)
+    _set_stable_widget_value(
+        "material_source_mode", "local" if video_source == "local" else "online"
+    )
+    if video_source != "local":
+        st.session_state["video_sources_multiselect"] = video_sources
     _set_stable_widget_value(
         "video_concat_mode_select", params.get("video_concat_mode") or "random"
     )
@@ -917,11 +963,7 @@ def _apply_pending_task_restore():
         "video_clip_duration_select", params.get("video_clip_duration", 3)
     )
     _set_stable_widget_value(
-        "video_clip_speed_slider",
-        # API 可以写入超过 WebUI 范围的速度，任务生成阶段会安全归一化，但
-        # 历史记录仍可能保留原值。恢复任务前再次归一化，避免给 Streamlit
-        # slider 注入越界值、NaN 或无穷值导致控件状态异常。
-        utils.normalize_clip_speed(params.get("video_clip_speed", 1.0)),
+        "video_fit_mode_select", params.get("video_fit_mode") or "cover"
     )
     _set_stable_widget_value("video_count_select", params.get("video_count", 1))
     st.session_state["match_materials_to_script"] = bool(
@@ -947,9 +989,6 @@ def _apply_pending_task_restore():
     _set_stable_widget_value("bgm_type_select", bgm_type)
     _set_stable_widget_value("bgm_volume_select", params.get("bgm_volume", 0.2))
     st.session_state["custom_bgm_file_input"] = params.get("bgm_file") or ""
-    st.session_state["sonilo_bgm_prompt_input"] = (
-        params.get("sonilo_bgm_prompt") or ""
-    )
 
     # 字幕设置。对旧任务中的越界数值做最小限幅，避免 Slider 无法初始化。
     st.session_state["subtitle_enabled_checkbox"] = bool(
@@ -983,8 +1022,6 @@ def _apply_pending_task_restore():
     # 同时清空当前页面已缓存的上传素材，避免恢复后误用另一个任务的文件。
     st.session_state["local_video_materials"] = []
     st.session_state.pop("custom_audio_file_uploader", None)
-    st.session_state.pop("custom_bgm_uploader", None)
-    st.session_state.pop("custom_bgm_validation", None)
     st.session_state["task_restore_upload_requirements"] = (
         _build_restore_upload_requirements(params)
     )
@@ -2087,6 +2124,12 @@ def _render_script_settings(panel, params):
                 help=tr("Video Keywords Help"),
                 key="video_terms",
             )
+            social_metadata.render(
+                tr,
+                params.video_subject,
+                params.video_script,
+                params.video_language,
+            )
 
 
 def _render_video_settings(panel, params):
@@ -2106,18 +2149,34 @@ def _render_video_settings(panel, params):
                 (tr("Local file"), "local"),
             ]
 
-            saved_video_source_name = config.app.get("video_source", "pexels")
-
-            params.video_source = stable_selectbox(
-                tr("Video Source"),
-                options=[value for _, value in video_sources],
-                default_value=saved_video_source_name,
-                key="video_source_select",
-                format_func=lambda value: dict(
-                    (v, label) for label, v in video_sources
-                )[value],
+            online_sources = [value for _, value in video_sources if value != "local"]
+            saved_sources = config.app.get("video_sources") or [
+                config.app.get("video_source", "pexels")
+            ]
+            saved_sources = [source for source in saved_sources if source in online_sources]
+            source_mode = stable_segmented_control(
+                tr("Material Source Type"),
+                ["online", "local"],
+                "local" if config.app.get("video_source") == "local" else "online",
+                "material_source_mode",
+                format_func=lambda value: tr("Online Sources") if value == "online" else tr("Local file"),
+                width="stretch",
             )
+            if source_mode == "online":
+                params.video_sources = st.multiselect(
+                    tr("Video Sources"),
+                    online_sources,
+                    default=saved_sources or ["pexels"],
+                    format_func=lambda value: dict((v, label) for label, v in video_sources)[value],
+                    help=tr("Video Sources Help"),
+                    key="video_sources_multiselect",
+                )
+                params.video_source = params.video_sources[0] if params.video_sources else ""
+            else:
+                params.video_sources = ["local"]
+                params.video_source = "local"
             config.app["video_source"] = params.video_source
+            config.app["video_sources"] = params.video_sources
 
             if params.video_source == "local":
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
@@ -2165,8 +2224,6 @@ def _render_video_settings(panel, params):
                 (tr("FadeOut"), VideoTransitionMode.fade_out.value),
                 (tr("SlideIn"), VideoTransitionMode.slide_in.value),
                 (tr("SlideOut"), VideoTransitionMode.slide_out.value),
-                (tr("ZoomIn"), VideoTransitionMode.zoom_in.value),
-                (tr("ZoomOut"), VideoTransitionMode.zoom_out.value),
             ]
             selected_transition_mode = stable_selectbox(
                 tr("Video Transition Mode"),
@@ -2201,28 +2258,27 @@ def _render_video_settings(panel, params):
             )
             params.video_aspect = VideoAspect(selected_aspect_ratio)
 
+            fit_modes = [
+                (tr("Fill and Crop"), "cover"),
+                (tr("Blurred Background"), "blur"),
+                (tr("Fit with Black Bars"), "contain"),
+            ]
+            params.video_fit_mode = stable_selectbox(
+                tr("Video Fit Mode"),
+                [value for _, value in fit_modes],
+                config.app.get("video_fit_mode", "cover"),
+                "video_fit_mode_select",
+                format_func=lambda value: dict((v, label) for label, v in fit_modes)[value],
+                help=tr("Video Fit Mode Help"),
+            )
+            config.app["video_fit_mode"] = params.video_fit_mode
+
             params.video_clip_duration = stable_selectbox(
                 tr("Clip Duration"),
                 options=[2, 3, 4, 5, 6, 7, 8, 9, 10],
                 default_value=3,
                 key="video_clip_duration_select",
                 help=tr("Clip Duration Help"),
-            )
-            clip_speed_key = localized_widget_key("video_clip_speed_slider")
-            # session_state 可能来自旧任务、API 参数或旧版页面状态。控件创建前
-            # 统一归一化，既保留合法选择，也确保 slider 始终收到 0.5～2.0
-            # 范围内的有限浮点数。
-            st.session_state[clip_speed_key] = utils.normalize_clip_speed(
-                st.session_state.get(clip_speed_key, 1.0)
-            )
-            params.video_clip_speed = st.slider(
-                tr("Clip Speed"),
-                min_value=0.5,
-                max_value=2.0,
-                step=0.05,
-                format="%.2fx",
-                key=clip_speed_key,
-                help=tr("Clip Speed Help"),
             )
             params.video_count = stable_selectbox(
                 tr("Number of Videos Generated Simultaneously"),
@@ -2339,14 +2395,12 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
 
 
 def _render_background_music_settings(params):
-    """渲染背景音乐来源与音量设置，并返回本次待保存的上传文件。"""
-    uploaded_bgm_file = None
+    """渲染背景音乐来源与音量设置。"""
     st.divider()
     bgm_options = [
         (tr("No Background Music"), ""),
         (tr("Random Background Music"), "random"),
         (tr("Custom Background Music"), "custom"),
-        (tr("Sonilo Background Music"), "sonilo"),
     ]
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
@@ -2356,6 +2410,15 @@ def _render_background_music_settings(params):
         format_func=lambda value: dict((v, label) for label, v in bgm_options)[value],
     )
     params.bgm_type = selected_bgm_type
+
+    if params.bgm_type == "custom":
+        custom_bgm_file = st.text_input(
+            tr("Custom Background Music File"),
+            key="custom_bgm_file_input",
+        )
+        if custom_bgm_file:
+            # 文件名由服务层映射到 resource/songs 后校验，UI 不接受任意路径。
+            params.bgm_file = custom_bgm_file.strip()
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
         options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
@@ -2364,165 +2427,6 @@ def _render_background_music_settings(params):
         format_func=lambda value: f"{int(value * 100)}%",
         disabled=not params.bgm_type,
     )
-    bgm_enabled = bgm_service.should_use_bgm(
-        params.bgm_type, params.bgm_volume
-    )
-
-    if params.bgm_type == "custom":
-        uploaded_bgm_file = st.file_uploader(
-            tr("Upload Background Music"),
-            type=[
-                extension.removeprefix(".")
-                for extension in bgm_service.SUPPORTED_BGM_EXTENSIONS
-            ],
-            accept_multiple_files=False,
-            key="custom_bgm_uploader",
-            help=tr("Upload Background Music Help"),
-            # Streamlit 默认会在控件上展示全局 200MB 上限。这里必须与服务层
-            # 30MB 硬限制保持一致，避免界面允许选择、提交时才被服务端拒绝。
-            max_upload_size=bgm_service.MAX_BGM_UPLOAD_BYTES // (1024 * 1024),
-        )
-        if uploaded_bgm_file is not None and bgm_enabled:
-            try:
-                safe_name = bgm_service.sanitize_upload_filename(
-                    uploaded_bgm_file.name
-                )
-                # Streamlit 在调整音量等任意控件后都会重新执行页面。使用内容哈希
-                # 区分上传文件，并在当前会话内缓存完整解码结果，既不能只凭同名、
-                # 同大小文件误用旧结果，也避免每次 rerun 都重复调用 FFmpeg。
-                validation_key = (
-                    safe_name,
-                    uploaded_bgm_file.size,
-                    hashlib.sha256(uploaded_bgm_file.getbuffer()).hexdigest(),
-                )
-                cached_validation = st.session_state.get("custom_bgm_validation")
-                if (
-                    not cached_validation
-                    or cached_validation.get("key") != validation_key
-                ):
-                    try:
-                        bgm_service.validate_bgm_upload(
-                            uploaded_bgm_file.name, uploaded_bgm_file
-                        )
-                    except bgm_service.BgmUploadError as exc:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": str(exc),
-                            "error_type": "upload",
-                        }
-                        # 同一个文件指纹的失败结果会进入会话缓存，因此这里只在
-                        # 首次真实执行校验时记录一次，避免普通控件 rerun 刷屏。
-                        logger.warning(
-                            "WebUI background music validation rejected: "
-                            f"name={safe_name}, error={str(exc)}"
-                        )
-                    except bgm_service.BgmServiceError as exc:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": str(exc),
-                            "error_type": "service",
-                        }
-                        logger.error(
-                            "WebUI background music validation failed: "
-                            f"name={safe_name}, error={str(exc)}"
-                        )
-                    else:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": "",
-                            "error_type": "",
-                        }
-                    st.session_state["custom_bgm_validation"] = cached_validation
-
-                if cached_validation.get("error"):
-                    if cached_validation.get("error_type") == "service":
-                        raise bgm_service.BgmServiceError(
-                            cached_validation["error"]
-                        )
-                    raise bgm_service.BgmUploadError(cached_validation["error"])
-            except bgm_service.BgmUploadError:
-                # 非法文件不能沿用上一次有效上传的名称，否则任务参数可能仍指向
-                # 历史 BGM。保留 UploadedFile 返回值，让用户点击生成时仍会被最终
-                # 服务端校验拦截，而不是静默生成一条没有背景音乐的视频。
-                params.bgm_file = ""
-                st.error(tr("Invalid Background Music"))
-            except bgm_service.BgmServiceError:
-                params.bgm_file = ""
-                st.error(tr("Background Music Validation Failed"))
-            else:
-                # 完整解码校验通过后才展示播放器和“已就绪”。文件仍只在点击
-                # 生成时持久化，用户仅预览或随后移除文件不会污染 storage/bgm。
-                uploaded_mime_type = str(
-                    getattr(uploaded_bgm_file, "type", "") or ""
-                )
-                preview_mime_type = (
-                    uploaded_mime_type
-                    if uploaded_mime_type.startswith("audio/")
-                    else mimetypes.guess_type(safe_name)[0] or "audio/mpeg"
-                )
-                st.audio(uploaded_bgm_file, format=preview_mime_type)
-                st.info(f"{tr('Background Music Ready')}: {safe_name}")
-                params.bgm_file = safe_name
-
-        custom_bgm_file = st.text_input(
-            tr("Custom Background Music File"),
-            key="custom_bgm_file_input",
-            disabled=uploaded_bgm_file is not None,
-        )
-        if uploaded_bgm_file is None and custom_bgm_file and bgm_enabled:
-            # 文件名由服务层映射到 storage/bgm 或 resource/songs 后校验，
-            # UI 不接受两个白名单目录之外的任意路径。
-            params.bgm_file = custom_bgm_file.strip()
-        elif not bgm_enabled:
-            # 上传控件继续保留用户已选择的文件，调高音量后的下一次 rerun 会自动
-            # 完整校验；当前任务参数必须清空，避免 0 音量任务保存或解析该文件。
-            params.bgm_file = ""
-
-    if params.bgm_type == "sonilo":
-        configured_key = str(config.app.get("sonilo_api_key", "") or "").strip()
-        effective_key = configured_key or os.getenv("SONILO_API_KEY", "").strip()
-        entered_key = st.text_input(
-            tr("Sonilo API Key"),
-            value=effective_key,
-            type="password",
-            key="sonilo_api_key_input",
-            help=tr("Sonilo API Key Help"),
-        ).strip()
-        # 用户要求已配置的 Key 直接回填到密码输入框。配置值优先于环境变量；
-        # 仅当用户确实修改输入或本来就使用配置时写回，避免把环境变量中的 Key
-        # 在无操作的情况下复制进 config.toml。
-        if configured_key or entered_key != effective_key:
-            config.app["sonilo_api_key"] = entered_key
-
-        params.sonilo_bgm_prompt = st.text_input(
-            tr("Sonilo Music Prompt"),
-            key="sonilo_bgm_prompt_input",
-            max_chars=sonilo_service.MAX_PROMPT_LENGTH,
-            help=tr("Sonilo Music Prompt Help"),
-        ).strip()
-        if params.video_count > 1:
-            st.warning(tr("Sonilo Multiple Videos Warning"))
-        if st.button(
-            tr("Test Sonilo Connection"),
-            key="test_sonilo_connection_button",
-            use_container_width=True,
-        ):
-            try:
-                sonilo_service.test_connection()
-            except sonilo_service.SoniloError as exc:
-                logger.warning(f"Sonilo connection test failed: {exc}")
-                st.error(tr("Sonilo Connection Test Failed").format(error=str(exc)))
-            else:
-                st.success(tr("Sonilo Connection Test Succeeded"))
-    if (
-        params.bgm_type == "sonilo"
-        and bgm_enabled
-        and not sonilo_service.is_enabled()
-    ):
-        # 音量为 0 时任务层不会生成或混合 Sonilo 配乐，因此无需提示 Key；
-        # 该判断与任务入口共用服务层规则，避免界面提示和实际执行条件分叉。
-        st.warning(tr("Sonilo API Key Required"))
-    return uploaded_bgm_file
 
 
 def _render_audio_settings(panel, params):
@@ -2933,8 +2837,8 @@ def _render_audio_settings(panel, params):
                             "Custom audio will be used directly. TTS synthesis will be skipped for this task."
                         )
                     )
-            uploaded_bgm_file = _render_background_music_settings(params)
-    return uploaded_audio_file, uploaded_bgm_file, voice_mode
+            _render_background_music_settings(params)
+    return uploaded_audio_file, voice_mode
 
 
 def _render_subtitle_settings(panel, params):
@@ -3166,7 +3070,7 @@ def _render_subtitle_settings(panel, params):
 
 
 def _render_generation_controls(
-    params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
+    params, uploaded_files, uploaded_audio_file, voice_mode
 ):
     """校验生成依赖、执行任务，并渲染日志与成片结果。"""
     restore_upload_requirements = st.session_state.get(
@@ -3215,39 +3119,34 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+        selected_sources = params.video_sources or [params.video_source]
+        if not selected_sources or any(
+            source not in ["pexels", "pixabay", "coverr", "local"]
+            for source in selected_sources
+        ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
 
-        if params.video_source == "pexels" and not config.app.get(
+        if "pexels" in selected_sources and not config.app.get(
             "pexels_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Pexels API Key"))
             st.stop()
 
-        if params.video_source == "pixabay" and not config.app.get(
+        if "pixabay" in selected_sources and not config.app.get(
             "pixabay_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Pixabay API Key"))
             st.stop()
 
-        if params.video_source == "coverr" and not config.app.get(
+        if "coverr" in selected_sources and not config.app.get(
             "coverr_api_keys", ""
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Coverr API Key"))
-            st.stop()
-
-        if (
-            params.bgm_type == "sonilo"
-            and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
-            and not sonilo_service.is_enabled()
-        ):
-            _remove_active_generation_task(task_id)
-            st.error(tr("Sonilo API Key Required"))
             st.stop()
 
         if params.video_source == "local" and not has_local_materials:
@@ -3270,31 +3169,6 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Task Restore Custom Audio Warning"))
             st.stop()
-
-        if uploaded_bgm_file and bgm_service.should_use_bgm(
-            params.bgm_type, params.bgm_volume
-        ):
-            try:
-                saved_bgm_name = bgm_service.save_bgm_upload(
-                    uploaded_bgm_file.name, uploaded_bgm_file
-                )
-            except bgm_service.BgmUploadError as exc:
-                _remove_active_generation_task(task_id)
-                logger.warning(f"WebUI background music upload rejected: {str(exc)}")
-                st.error(tr("Invalid Background Music"))
-                st.stop()
-            except bgm_service.BgmServiceError as exc:
-                _remove_active_generation_task(task_id)
-                logger.error(f"WebUI background music upload failed: {str(exc)}")
-                st.error(tr("Background Music Validation Failed"))
-                st.stop()
-            # 保存成功后只把文件名写入任务参数。视频服务会在两个 BGM 白名单
-            # 目录中重新解析，避免把服务器绝对路径持久化或展示给用户。
-            params.bgm_file = saved_bgm_name
-        elif uploaded_bgm_file:
-            # 0 音量时视频服务不会使用任何 BGM，因此不再把已经预览的上传文件
-            # 持久化到 storage。用户之后调高音量时可直接再次点击生成完成保存。
-            params.bgm_file = ""
 
         if uploaded_audio_file:
             task_dir = utils.task_dir(task_id)
@@ -3384,18 +3258,6 @@ def _render_generation_controls(
 
             video_files = result.get("videos", [])
             st.success(tr("Video Generation Completed"))
-            for warning in result.get("warnings") or []:
-                if (
-                    isinstance(warning, Mapping)
-                    and warning.get("code") == "sonilo_bgm_failed"
-                ):
-                    st.warning(
-                        tr("Sonilo BGM Fallback Warning").format(
-                            index=warning.get("video_index", "")
-                        )
-                    )
-                else:
-                    st.warning(str(warning))
             try:
                 if video_files:
                     player_cols = st.columns(len(video_files) * 2 + 1)
@@ -3445,21 +3307,16 @@ def _render_application():
     _render_script_settings(left_panel, params)
 
     uploaded_files = _render_video_settings(middle_panel, params)
-    uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
-        audio_panel, params
-    )
+    uploaded_audio_file, voice_mode = _render_audio_settings(audio_panel, params)
 
     _render_subtitle_settings(right_panel, params)
 
-    _render_generation_controls(
-        params,
-        uploaded_files,
-        uploaded_audio_file,
-        uploaded_bgm_file,
-        voice_mode,
-    )
+    _render_generation_controls(params, uploaded_files, uploaded_audio_file, voice_mode)
 
-    config.save_config()
+    from webui.components import performance_panel
 
+    performance_panel.render(tr)
+    youtube_panel.render(tr, params)
+    tiktok_panel.render(tr, params)
 
 _render_application()

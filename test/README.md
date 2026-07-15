@@ -4,38 +4,28 @@ This directory contains unit tests for the **MoneyPrinterTurbo** project.
 
 ## Directory Structure
 
-- `services/`: Domain-focused unit and controller tests
-  - `test_task.py`: Task pipeline tests
-  - `test_task_manager.py`: In-memory and Redis queue tests
-  - `test_controller_*.py`: API controller tests split by controller domain
-  - `test_video.py`, `test_voice.py`: Media service tests
-- `test_main.py`: Application entry-point test
+- `services/`: Tests for components in the `app/services` directory  
+  - `test_video.py`: Tests for the video service  
+  - `test_task.py`: Tests for the task service  
+  - `test_voice.py`: Tests for the voice service  
 
 ## Running Tests
 
-The CI suite uses pytest, which also runs the existing `unittest.TestCase`
-tests:
+You can run the tests using Python’s built-in `unittest` framework:
 
 ```bash
 # Run all tests
-uv run python -X utf8 -m pytest -q test
+python -m unittest discover -s test
 
 # Run a specific test file
-uv run python -X utf8 -m pytest -q test/services/test_video.py
+python -m unittest test/services/test_video.py
 
 # Run a specific test class
-uv run python -X utf8 -m pytest -q test/services/test_video.py::TestVideoService
+python -m unittest test.services.test_video.TestVideoService
 
 # Run a specific test method
-uv run python -X utf8 -m pytest -q test/services/test_video.py::TestVideoService::test_preprocess_video
-```
-
-To run the same branch coverage check used by CI:
-
-```bash
-uv run python -X utf8 -m coverage run -m pytest -q test
-uv run python -m coverage report
-```
+python -m unittest test.services.test_video.TestVideoService.test_preprocess_video
+````
 
 Live provider tests are skipped by default. To run tests that may call external
 TTS or LLM services, set `MPT_RUN_INTEGRATION_TESTS=1` and provide the required
@@ -45,10 +35,9 @@ provider credentials.
 
 To add tests for other components, follow these guidelines:
 
-1. Name files `test_<domain>.py` and keep each file focused on one domain.
-2. Split broad controller suites into files such as `test_controller_video.py`.
-3. Use either pytest functions or `unittest.TestCase`; pytest collects both.
-4. Name test functions and methods with the `test_` prefix.
+1. Create test files prefixed with `test_` in the appropriate subdirectory
+2. Use `unittest.TestCase` as the base class for your test classes
+3. Name test methods with the `test_` prefix
 
 ## Test Resources
 

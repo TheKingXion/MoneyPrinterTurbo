@@ -14,13 +14,15 @@ from app.config import config
 class UploadPostService:
     API_BASE = "https://api.upload-post.com"
 
-    def __init__(self):
-        self.api_key = config.app.get("upload_post_api_key", "")
-        self.username = config.app.get("upload_post_username", "")
-        self.enabled = config.app.get("upload_post_enabled", False)
-        self.platforms = config.app.get("upload_post_platforms", ["tiktok", "instagram"])
-        self.auto_upload = config.app.get("upload_post_auto_upload", False)
-        self.youtube_privacy_status = config.app.get("upload_post_youtube_privacy_status", "public")
+    def __init__(self, settings: Optional[dict] = None):
+        dedicated_tiktok = settings is not None
+        settings = settings or {**getattr(config, "ui", {}), **config.app}
+        self.api_key = settings.get("upload_post_api_key", "")
+        self.username = settings.get("upload_post_username", "")
+        self.enabled = settings.get("enabled", False) if dedicated_tiktok else settings.get("upload_post_enabled", False)
+        self.platforms = ["tiktok"] if dedicated_tiktok else settings.get("upload_post_platforms", ["tiktok", "instagram"])
+        self.auto_upload = settings.get("auto_upload", False) if dedicated_tiktok else settings.get("upload_post_auto_upload", False)
+        self.youtube_privacy_status = settings.get("upload_post_youtube_privacy_status", "public")
 
     def is_configured(self) -> bool:
         return bool(self.api_key and self.username and self.enabled)
@@ -32,6 +34,7 @@ class UploadPostService:
         platforms: Optional[list] = None,
         privacy_level: str = "PUBLIC_TO_EVERYONE",
         youtube_extra: Optional[dict] = None,
+        idempotency_key: str = "",
     ) -> dict:
         if not self.is_configured():
             logger.warning("Upload-Post is not configured. Skipping cross-post.")
@@ -55,6 +58,8 @@ class UploadPostService:
                     ('title', title[:2200]),
                     ('privacy_level', privacy_level),
                 ]
+                if idempotency_key:
+                    data.append(('request_id', idempotency_key))
 
                 for platform in platforms:
                     data.append(('platform[]', platform))
@@ -70,6 +75,8 @@ class UploadPostService:
                     data.append(('containsSyntheticMedia', "true"))
 
                 headers = {'Authorization': f'Apikey {self.api_key}'}
+                if idempotency_key:
+                    headers['Idempotency-Key'] = idempotency_key
 
                 response = requests.post(
                     f"{self.API_BASE}/api/upload",
@@ -83,7 +90,7 @@ class UploadPostService:
                 result = response.json()
 
                 if result.get('success'):
-                    logger.info(f"✅ Video cross-posted successfully! Request ID: {result.get('request_id')}")
+                    logger.info(f"Video cross-posted successfully. Request ID: {result.get('request_id')}")
                 else:
                     logger.warning(f"Cross-post failed: {result.get('message', 'Unknown error')}")
 

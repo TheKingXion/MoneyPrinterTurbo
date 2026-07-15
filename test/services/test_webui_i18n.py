@@ -3,14 +3,27 @@ import json
 from pathlib import Path
 import unittest
 
-from app.utils import utils
-
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
+WEBUI_COMPONENTS = ROOT_DIR / "webui" / "components"
 I18N_DIR = ROOT_DIR / "webui" / "i18n"
-LLM_PROVIDER_TIPS_PREFIX = "llm_provider_tips."
-TTS_PROVIDER_TIPS_PREFIX = "tts_provider_tips."
+
+SPANISH_SHARED_STATIC_VALUES = {
+    "Chatterbox Base URL Placeholder",
+    "Chatterbox Voices Placeholder",
+    "Coverr",
+    "FadeIn",
+    "FadeOut",
+    "Pexels",
+    "Pixabay",
+    "Publishing Hashtags",
+    "Scanner",
+    "SlideIn",
+    "SlideOut",
+    "Stitch",
+    "Subtitle Background Color",
+}
 
 
 class _TrKeyVisitor(ast.NodeVisitor):
@@ -29,89 +42,72 @@ class _TrKeyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _webui_sources():
+    sources = [WEBUI_MAIN]
+    if WEBUI_COMPONENTS.exists():
+        sources.extend(sorted(WEBUI_COMPONENTS.rglob("*.py")))
+    return sources
+
+
+def _static_translation_keys():
+    visitor = _TrKeyVisitor()
+    for source in _webui_sources():
+        visitor.visit(ast.parse(source.read_text(encoding="utf-8")))
+    return visitor.keys
+
+
+def _load_locale(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _load_translation(locale):
-    data = json.loads((I18N_DIR / f"{locale}.json").read_text(encoding="utf-8"))
-    return data.get("Translation", {})
+    return _load_locale(I18N_DIR / f"{locale}.json").get("Translation", {})
 
 
 class TestWebuiI18n(unittest.TestCase):
-    def test_saved_ui_language_takes_priority_over_browser_locale(self):
-        language = utils.resolve_ui_language(
-            saved_language="de",
-            browser_locale="zh-CN",
-            supported_languages=["zh", "en", "de"],
-        )
+    def test_locale_json_documents_are_valid(self):
+        for path in sorted(I18N_DIR.glob("*.json")):
+            with self.subTest(locale=path.stem):
+                data = _load_locale(path)
+                self.assertIsInstance(data.get("Language"), str)
+                self.assertTrue(data["Language"].strip())
+                self.assertIsInstance(data.get("Translation"), dict)
+                self.assertTrue(data["Translation"])
+                self.assertTrue(
+                    all(
+                        isinstance(key, str)
+                        and isinstance(value, str)
+                        and value.strip()
+                        for key, value in data["Translation"].items()
+                    )
+                )
 
-        self.assertEqual(language, "de")
+    def test_every_locale_has_complete_key_set(self):
+        expected_keys = set(_load_translation("en"))
+        for path in sorted(I18N_DIR.glob("*.json")):
+            with self.subTest(locale=path.stem):
+                self.assertEqual(set(_load_translation(path.stem)), expected_keys)
 
-    def test_browser_locale_is_normalized_to_supported_base_language(self):
-        self.assertEqual(
-            utils.resolve_ui_language("", "zh-CN", ["zh", "en"]),
-            "zh",
-        )
-        self.assertEqual(
-            utils.resolve_ui_language(None, "pt_BR", ["en", "pt"]),
-            "pt",
-        )
+    def test_english_spanish_and_russian_cover_static_webui_labels(self):
+        static_keys = _static_translation_keys()
+        for locale in ("en", "es", "ru"):
+            with self.subTest(locale=locale):
+                self.assertEqual(
+                    sorted(static_keys - set(_load_translation(locale))), []
+                )
 
-    def test_unsupported_browser_locale_falls_back_to_english(self):
-        language = utils.resolve_ui_language(
-            saved_language="",
-            browser_locale="fr-FR",
-            supported_languages=["zh", "en"],
-        )
-
-        self.assertEqual(language, "en")
-
-    def test_english_locale_covers_static_webui_labels(self):
-        tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
-        visitor = _TrKeyVisitor()
-        visitor.visit(tree)
-
-        en_keys = set(_load_translation("en"))
-
-        self.assertEqual(sorted(visitor.keys - en_keys), [])
-
-    def test_russian_locale_covers_english_locale(self):
-        en_keys = set(_load_translation("en"))
-        ru_keys = set(_load_translation("ru"))
-        # Provider 配置说明只维护中英文，俄语及其它 locale 运行时统一回退英文。
-        # 这里排除动态 tips key，避免继续复制一整套不会被读取的英文文案。
-        required_en_keys = {
+    def test_spanish_static_labels_do_not_use_english_fallbacks(self):
+        static_keys = _static_translation_keys()
+        english = _load_translation("en")
+        spanish = _load_translation("es")
+        untranslated = {
             key
-            for key in en_keys
-            if not key.startswith(
-                (LLM_PROVIDER_TIPS_PREFIX, TTS_PROVIDER_TIPS_PREFIX)
-            )
+            for key in static_keys
+            if spanish[key] == english[key]
+            and key not in SPANISH_SHARED_STATIC_VALUES
         }
 
-        self.assertEqual(sorted(required_en_keys - ru_keys), [])
-
-    def test_russian_locale_does_not_duplicate_provider_tips(self):
-        ru_keys = set(_load_translation("ru"))
-
-        self.assertEqual(
-            sorted(
-                key for key in ru_keys if key.startswith(LLM_PROVIDER_TIPS_PREFIX)
-            ),
-            [],
-        )
-
-        self.assertEqual(
-            sorted(
-                key for key in ru_keys if key.startswith(TTS_PROVIDER_TIPS_PREFIX)
-            ),
-            [],
-        )
-
-    def test_russian_locale_covers_static_webui_labels(self):
-        tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
-        visitor = _TrKeyVisitor()
-        visitor.visit(tree)
-
-        ru_keys = set(_load_translation("ru"))
-
-        self.assertEqual(sorted(visitor.keys - ru_keys), [])
+        self.assertEqual(sorted(untranslated), [])
 
     def test_script_language_options_include_russian(self):
         tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))

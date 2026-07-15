@@ -33,6 +33,21 @@ if not defined STREAMLIT_CMD (
     exit /b 1
 )
 
+rem TikTok OAuth callbacks and scheduled publishing require the local API.
+rem Start it only when the configured default port is not already listening.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+    echo ***** Starting MoneyPrinterTurbo API at http://127.0.0.1:8080 *****
+    if exist "%CURRENT_DIR%\.venv\Scripts\python.exe" (
+        start "MoneyPrinterTurbo API" /min "%CURRENT_DIR%\.venv\Scripts\python.exe" main.py
+    ) else if exist "%CURRENT_DIR%\lib\python\python.exe" (
+        start "MoneyPrinterTurbo API" /min "%CURRENT_DIR%\lib\python\python.exe" main.py
+    ) else (
+        start "MoneyPrinterTurbo API" /min uv run python main.py
+    )
+    timeout /t 2 /nobreak >nul
+)
+
 set "SELECTED_WEBUI_PORT="
 for /f %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$hostAddress=$null; foreach ($address in [Net.Dns]::GetHostAddresses($env:MPT_WEBUI_HOST)) { if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $hostAddress=$address; break } }; if ($null -eq $hostAddress) { exit 1 }; $preferred=[int]$env:MPT_WEBUI_PORT; $candidates=New-Object System.Collections.Generic.List[int]; $candidates.Add($preferred); foreach ($candidate in 8502..8599) { if ($candidate -ne $preferred) { $candidates.Add($candidate) } }; foreach ($port in $candidates) { $socket=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork,[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp); try { $socket.Bind([Net.IPEndPoint]::new($hostAddress,$port)); $socket.Close(); Write-Output $port; exit 0 } catch { try { $socket.Close() } catch {} } }; exit 1"') do set "SELECTED_WEBUI_PORT=%%P"
 

@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,6 +76,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
                             "large": {
                                 "width": 1920,
                                 "url": "https://example.com/video.mp4",
+                                "thumbnail": "https://example.com/video.jpg",
                             }
                         },
                     }
@@ -86,13 +88,18 @@ class TestMaterialTlsVerification(unittest.TestCase):
             results = material.search_videos_pixabay("cat", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].thumbnail_url, "https://example.com/video.jpg")
         self.assertFalse(get.call_args.kwargs["verify"])
 
     def test_save_video_uses_tls_verification_by_default(self):
         config.app.pop("tls_verify", None)
         config.proxy.clear()
 
-        fake_response = SimpleNamespace(content=b"fake-video")
+        fake_response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            iter_content=lambda chunk_size: iter([b"fake-video"]),
+            close=lambda: None,
+        )
 
         class FakeVideoFileClip:
             duration = 1
@@ -114,6 +121,133 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
             self.assertTrue(os.path.exists(video_path))
             self.assertTrue(get.call_args.kwargs["verify"])
+            self.assertTrue(get.call_args.kwargs["stream"])
+
+
+class TestMaterialVideoDownloads(unittest.TestCase):
+    class FakeVideoFileClip:
+        duration = 1
+        fps = 24
+
+        def __init__(self, path):
+            self.path = path
+
+        def close(self):
+            return None
+
+    @staticmethod
+    def _response(chunks=(b"video-data",), error=None):
+        def raise_for_status():
+            if error:
+                raise error
+
+        return SimpleNamespace(
+            raise_for_status=raise_for_status,
+            iter_content=lambda chunk_size: iter(chunks),
+            close=lambda: None,
+        )
+
+    def test_save_video_cache_hit_avoids_network_and_validation(self):
+        url = "https://example.com/cached.mp4?token=first"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(
+                temp_dir, f"vid-{material.utils.md5(url.split('?')[0])}.mp4"
+            )
+            with open(path, "wb") as cached_file:
+                cached_file.write(b"cached")
+
+            with patch.object(material.requests, "get") as get, patch.object(
+                material, "VideoFileClip"
+            ) as video_clip:
+                result = material.save_video(url, save_dir=temp_dir)
+
+            self.assertEqual(result, f"{temp_dir}/vid-{material.utils.md5(url.split('?')[0])}.mp4")
+            get.assert_not_called()
+            video_clip.assert_not_called()
+
+    def test_save_video_atomically_publishes_streamed_download(self):
+        url = "https://example.com/atomic.mp4?token=abc"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            expected = f"{temp_dir}/vid-{material.utils.md5(url.split('?')[0])}.mp4"
+            partial = f"{expected}.partial"
+
+            def chunks():
+                self.assertFalse(os.path.exists(expected))
+                yield b"video-"
+                self.assertTrue(os.path.exists(partial))
+                self.assertFalse(os.path.exists(expected))
+                yield b"data"
+
+            response = self._response(chunks=chunks())
+            with patch.object(material.requests, "get", return_value=response) as get, patch.object(
+                material, "VideoFileClip", self.FakeVideoFileClip
+            ), patch.object(material.os, "fsync", wraps=os.fsync) as fsync, patch.object(
+                material.os, "replace", wraps=os.replace
+            ) as replace:
+                result = material.save_video(url, save_dir=temp_dir)
+
+            self.assertEqual(result, expected)
+            with open(expected, "rb") as video_file:
+                self.assertEqual(video_file.read(), b"video-data")
+            self.assertFalse(os.path.exists(partial))
+            self.assertTrue(get.call_args.kwargs["stream"])
+            fsync.assert_called_once()
+            replace.assert_called_once_with(partial, expected)
+
+    def test_save_video_http_failure_removes_partial(self):
+        url = "https://example.com/failure.mp4"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            expected = f"{temp_dir}/vid-{material.utils.md5(url)}.mp4"
+            partial = f"{expected}.partial"
+            with open(partial, "wb") as stale_partial:
+                stale_partial.write(b"stale")
+
+            response = self._response(error=requests.HTTPError("503"))
+            with patch.object(material.requests, "get", return_value=response):
+                with self.assertRaises(requests.HTTPError):
+                    material.save_video(url, save_dir=temp_dir)
+
+            self.assertFalse(os.path.exists(expected))
+            self.assertFalse(os.path.exists(partial))
+
+    def test_save_video_coalesces_concurrent_same_url(self):
+        url = "https://example.com/concurrent.mp4?token=abc"
+        download_started = threading.Event()
+        allow_download = threading.Event()
+
+        def chunks():
+            download_started.set()
+            self.assertTrue(allow_download.wait(timeout=5))
+            yield b"video-data"
+
+        response = self._response(chunks=chunks())
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            material.requests, "get", return_value=response
+        ) as get, patch.object(material, "VideoFileClip", self.FakeVideoFileClip):
+            results = []
+            errors = []
+
+            def save():
+                try:
+                    results.append(material.save_video(url, save_dir=temp_dir))
+                except Exception as exc:
+                    errors.append(exc)
+
+            first = threading.Thread(target=save)
+            second = threading.Thread(target=save)
+            first.start()
+            self.assertTrue(download_started.wait(timeout=5))
+            second.start()
+            allow_download.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(get.call_count, 1)
 
     def test_download_videos_accepts_plain_string_concat_mode(self):
         """
@@ -170,13 +304,13 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         self.assertEqual(
             downloaded_urls,
-            [
-                "https://v.example/a1.mp4",
-                "https://v.example/b1.mp4",
-                "https://v.example/a2.mp4",
-            ],
+                [
+                    "https://v.example/a1.mp4",
+                    "https://v.example/a2.mp4",
+                    "https://v.example/b1.mp4",
+                ],
         )
-        self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/b1.mp4", "/tmp/a2.mp4"])
+        self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/a2.mp4", "/tmp/b1.mp4"])
 
 
 class TestCoverrProvider(unittest.TestCase):
@@ -425,6 +559,79 @@ class TestCoverrProvider(unittest.TestCase):
         # 3. 返回值正确
         self.assertEqual(result, ["/tmp/coverr-saved.mp4"])
 
+
+class TestReviewedMaterialWorkflow(unittest.TestCase):
+    def _item(self, provider, index):
+        return material.MaterialInfo(
+            provider=provider,
+            url=f"https://example.com/{provider}-{index}.mp4",
+            duration=9,
+            thumbnail_url=f"https://example.com/{provider}-{index}.jpg",
+        )
+
+    def test_pexels_is_primary_when_it_has_enough_relevant_candidates(self):
+        pexels = [self._item("pexels", index) for index in range(4)]
+        with patch.object(material, "search_videos_pexels", return_value=pexels):
+            with patch.object(material, "search_videos_pixabay") as pixabay:
+                with patch.object(
+                    material.clip_ranker,
+                    "rank_materials",
+                    side_effect=lambda items, **kwargs: list(items)[: kwargs["limit"]],
+                ):
+                    result = material.search_scene_candidates(
+                        {"index": 0, "query": "teenage boy smartphone"},
+                        ["pexels", "pixabay"],
+                        limit=4,
+                    )
+        self.assertEqual([item.provider for item in result], ["pexels"] * 4)
+        pixabay.assert_not_called()
+
+    def test_pixabay_is_used_only_as_fallback(self):
+        pexels = [self._item("pexels", 0)]
+        pixabay_items = [self._item("pixabay", index) for index in range(3)]
+        with patch.object(material, "search_videos_pexels", return_value=pexels):
+            with patch.object(
+                material, "search_videos_pixabay", return_value=pixabay_items
+            ) as pixabay:
+                with patch.object(
+                    material.clip_ranker,
+                    "rank_materials",
+                    side_effect=lambda items, **kwargs: list(items)[: kwargs["limit"]],
+                ):
+                    result = material.search_scene_candidates(
+                        {"index": 0, "query": "teenage boy smartphone"},
+                        ["pexels", "pixabay"],
+                        limit=4,
+                    )
+        self.assertEqual([item.provider for item in result], ["pexels"] + ["pixabay"] * 3)
+        pixabay.assert_called_once()
+
+    def test_strict_search_retries_with_relaxed_query_when_empty(self):
+        fallback_item = self._item("pexels", 1)
+        with patch.object(
+            material,
+            "search_videos_pexels",
+            side_effect=[[], [fallback_item]],
+        ) as search:
+            with patch.object(
+                material.clip_ranker,
+                "rank_materials",
+                side_effect=lambda items, **kwargs: list(items)[: kwargs["limit"]],
+            ):
+                result = material.search_scene_candidates(
+                    {
+                        "index": 0,
+                        "query": "young adult woman securing data smartphone warehouse",
+                    },
+                    ["pexels"],
+                    limit=2,
+                )
+
+        self.assertEqual(result, [fallback_item])
+        self.assertEqual(
+            search.call_args_list[1].kwargs["search_term"],
+            "person securing data smartphone",
+        )
 
 if __name__ == "__main__":
     unittest.main()

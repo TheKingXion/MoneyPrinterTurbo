@@ -1,6 +1,10 @@
+import math
 import os
 import random
 import threading
+import time
+import weakref
+from contextlib import contextmanager
 from typing import List
 from urllib.parse import urlencode
 
@@ -10,11 +14,55 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.services import clip_ranker
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+_download_locks_guard = threading.Lock()
+_download_locks = weakref.WeakValueDictionary()
+
+
+@contextmanager
+def _cache_key_lock(cache_key: str, lock_path: str):
+    with _download_locks_guard:
+        thread_lock = _download_locks.get(cache_key)
+        if thread_lock is None:
+            thread_lock = threading.Lock()
+            _download_locks[cache_key] = thread_lock
+
+    with thread_lock:
+        lock_file = open(lock_path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.path.getsize(lock_path) == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+            yield
+        finally:
+            try:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
 
 def _get_tls_verify() -> bool:
@@ -39,7 +87,6 @@ def get_api_key(cfg_key: str):
     if not api_keys:
         raise ValueError(
             f"\n\n##### {cfg_key} is not set #####\n\nPlease set it in the config.toml file: {config.config_file}\n\n"
-            f"{utils.to_json(config.app)}"
         )
 
     # if only one key is provided, return it
@@ -66,9 +113,9 @@ def search_videos_pexels(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     }
     # Build URL
-    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    params = {"query": search_term, "per_page": 30, "orientation": video_orientation}
     query_url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"searching Pexels videos: query={search_term}, with proxy={bool(config.proxy)}")
 
     try:
         r = requests.get(
@@ -100,6 +147,8 @@ def search_videos_pexels(
                     item.provider = "pexels"
                     item.url = video["link"]
                     item.duration = duration
+                    item.thumbnail_url = str(v.get("image") or "")
+                    item.search_term = search_term
                     video_items.append(item)
                     break
         return video_items
@@ -123,11 +172,11 @@ def search_videos_pixabay(
     params = {
         "q": search_term,
         "video_type": "all",  # Accepted values: "all", "film", "animation"
-        "per_page": 50,
+        "per_page": 30,
         "key": api_key,
     }
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"searching Pixabay videos: query={search_term}, with proxy={bool(config.proxy)}")
 
     try:
         r = requests.get(
@@ -156,6 +205,8 @@ def search_videos_pixabay(
                     item.provider = "pixabay"
                     item.url = video["url"]
                     item.duration = duration
+                    item.thumbnail_url = str(video.get("thumbnail") or "")
+                    item.search_term = search_term
                     video_items.append(item)
                     break
         return video_items
@@ -193,12 +244,12 @@ def search_videos_coverr(
     headers = {"Authorization": f"Bearer {api_key}"}
     params = {
         "query": search_term,
-        "page_size": 20,
+        "page_size": 30,
         "urls": "true",
         "sort": "popular",
     }
     query_url = f"https://api.coverr.co/videos?{urlencode(params)}"
-    logger.info(f"searching videos: {query_url}, with proxies: {config.proxy}")
+    logger.info(f"searching Coverr videos: query={search_term}, with proxy={bool(config.proxy)}")
 
     try:
         r = requests.get(
@@ -233,6 +284,13 @@ def search_videos_coverr(
             item.provider = "coverr"
             item.url = mp4_download_url
             item.duration = duration
+            item.thumbnail_url = str(
+                v.get("thumbnail")
+                or v.get("poster")
+                or (v.get("urls") or {}).get("thumbnail")
+                or ""
+            )
+            item.search_term = search_term
             video_items.append(item)
         return video_items
     except Exception as e:
@@ -245,50 +303,75 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
 
     url_without_query = video_url.split("?")[0]
     url_hash = utils.md5(url_without_query)
     video_id = f"vid-{url_hash}"
     video_path = f"{save_dir}/{video_id}.mp4"
+    partial_path = f"{video_path}.partial"
+    lock_path = f"{video_path}.lock"
 
-    # if video already exists, return the path
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        logger.info(f"video already exists: {video_path}")
-        return video_path
+    with _cache_key_lock(video_path, lock_path):
+        # Recheck after locking so concurrent callers share the completed download.
+        if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+            logger.info(f"video already exists: {video_path}")
+            return video_path
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
-
-    # if video does not exist, download it
-    with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        }
+        response = None
+        try:
+            response = requests.get(
                 video_url,
                 headers=headers,
                 proxies=config.proxy,
                 verify=_get_tls_verify(),
                 timeout=(60, 240),
-            ).content
-        )
+                stream=True,
+            )
+            response.raise_for_status()
+            with open(partial_path, "wb") as partial_file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        partial_file.write(chunk)
+                partial_file.flush()
+                os.fsync(partial_file.fileno())
+        except Exception:
+            try:
+                os.remove(partial_path)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception as close_error:
+                    logger.warning(
+                        f"failed to close video response: {video_url}, error: {str(close_error)}"
+                    )
 
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         clip = None
+        is_valid = False
         try:
-            clip = VideoFileClip(video_path)
+            if not os.path.exists(partial_path) or os.path.getsize(partial_path) == 0:
+                raise ValueError("downloaded video is empty")
+            clip = VideoFileClip(partial_path)
             duration = clip.duration
             fps = clip.fps
             if duration > 0 and fps > 0:
-                return video_path
+                is_valid = True
         except Exception as e:
-            logger.warning(f"invalid video file: {video_path} => {str(e)}")
+            logger.warning(f"invalid video file: {partial_path} => {str(e)}")
             try:
-                os.remove(video_path)
+                os.remove(partial_path)
+            except FileNotFoundError:
+                pass
             except Exception as remove_error:
                 logger.warning(
-                    f"failed to remove invalid video file: {video_path}, error: {str(remove_error)}"
+                    f"failed to remove invalid video file: {partial_path}, error: {str(remove_error)}"
                 )
         finally:
             if clip is not None:
@@ -296,26 +379,140 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                     clip.close()
                 except Exception as close_error:
                     logger.warning(
-                        f"failed to close video clip: {video_path}, error: {str(close_error)}"
+                        f"failed to close video clip: {partial_path}, error: {str(close_error)}"
                     )
+        if not is_valid:
+            try:
+                os.remove(partial_path)
+            except FileNotFoundError:
+                pass
+            return ""
+        try:
+            os.replace(partial_path, video_path)
+        except Exception:
+            try:
+                os.remove(partial_path)
+            except FileNotFoundError:
+                pass
+            raise
+        return video_path
     return ""
+
+
+def search_scene_candidates(
+    scene: dict,
+    sources: List[str],
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    minimum_duration: int = 3,
+    limit: int = 4,
+) -> List[MaterialInfo]:
+    search_functions = {
+        "pexels": search_videos_pexels,
+        "pixabay": search_videos_pixabay,
+        "coverr": search_videos_coverr,
+    }
+    ordered_sources = [name for name in ("pexels", "pixabay", "coverr") if name in sources]
+    accepted = []
+    fallback = []
+    for source_name in ordered_sources:
+        if len(accepted) >= limit:
+            break
+        try:
+            raw = search_functions[source_name](
+                search_term=scene["query"],
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            )
+            if raw:
+                fallback.append(raw[0])
+            ranked = clip_ranker.rank_materials(
+                raw,
+                query=scene["query"],
+                required_objects=scene.get("required_objects"),
+                excluded_elements=scene.get("excluded_elements"),
+                limit=limit - len(accepted),
+            )
+            for item in ranked:
+                item.scene_index = int(scene.get("index", -1))
+            accepted.extend(ranked)
+            logger.info(
+                f"CLIP accepted {len(ranked)} {source_name} candidates for scene "
+                f"{scene.get('index', -1)}"
+            )
+        except Exception as exc:
+            logger.warning(f"candidate search failed for {source_name}: {exc}")
+    if clip_ranker.requires_strict_verification(scene["query"]):
+        if accepted:
+            return accepted[:limit]
+        relaxed_query = clip_ranker.relax_query_for_fallback(scene["query"])
+        logger.warning(
+            f"no strict candidates for '{scene['query']}', retrying as '{relaxed_query}'"
+        )
+        relaxed = []
+        for source_name in ordered_sources:
+            try:
+                raw = search_functions[source_name](
+                    search_term=relaxed_query,
+                    minimum_duration=minimum_duration,
+                    video_aspect=video_aspect,
+                )
+                ranked = clip_ranker.rank_materials(
+                    raw,
+                    query=relaxed_query,
+                    required_objects=scene.get("required_objects"),
+                    excluded_elements=scene.get("excluded_elements"),
+                    limit=limit - len(relaxed),
+                    threshold=0.22,
+                )
+                relaxed.extend(ranked)
+                if len(relaxed) >= limit:
+                    break
+            except Exception as exc:
+                logger.warning(f"relaxed candidate search failed for {source_name}: {exc}")
+        if relaxed:
+            for item in relaxed:
+                item.scene_index = int(scene.get("index", -1))
+            return relaxed[:limit]
+        return accepted[:limit]
+    return (accepted or fallback[:1])[:limit]
 
 
 def download_videos(
     task_id: str,
     search_terms: List[str],
     source: str = "pexels",
+    sources: List[str] | None = None,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
 ) -> List[str]:
-    search_videos = search_videos_pexels
-    if source == "pixabay":
-        search_videos = search_videos_pixabay
-    elif source == "coverr":
-        search_videos = search_videos_coverr
+    search_functions = {
+        "pexels": search_videos_pexels,
+        "pixabay": search_videos_pixabay,
+        "coverr": search_videos_coverr,
+    }
+    source_names = list(dict.fromkeys(sources or [source]))
+    source_names = [name for name in source_names if name in search_functions]
+    if not source_names:
+        raise ValueError("at least one valid online video source is required")
+
+    def search_videos(search_term, minimum_duration, video_aspect):
+        return search_scene_candidates(
+            scene={
+                "index": -1,
+                "query": search_term,
+                "required_objects": [],
+                "excluded_elements": [],
+            },
+            sources=source_names,
+            video_aspect=video_aspect,
+            minimum_duration=minimum_duration,
+            limit=8,
+        )
+
+    logger.info(f"using online video sources: {', '.join(source_names)}")
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -432,15 +629,23 @@ def _download_videos_by_script_order(
 
     video_paths = []
     total_duration = 0.0
-    candidate_index = 0
-    while candidate_groups and total_duration <= audio_duration:
-        has_candidate = False
-        for search_term, term_items in candidate_groups:
-            if candidate_index >= len(term_items):
-                continue
+    group_count = max(len(candidate_groups), 1)
+    required_clip_count = max(1, math.ceil(audio_duration / max(max_clip_duration, 1)))
+    clips_per_group, extra_clip_groups = divmod(required_clip_count, group_count)
 
-            has_candidate = True
-            item = term_items[candidate_index]
+    # Keep each search term together for its share of the narration. The old
+    # round-robin order restarted the story every few clips on longer videos.
+    for group_index, (search_term, term_items) in enumerate(candidate_groups):
+        target_clip_count = clips_per_group + (
+            1 if group_index < extra_clip_groups else 0
+        )
+        if target_clip_count <= 0:
+            continue
+        term_duration = 0.0
+        downloaded_for_term = 0
+        for item in term_items:
+            if downloaded_for_term >= target_clip_count:
+                break
             try:
                 logger.info(
                     f"downloading ordered video for '{search_term}': {item.url}"
@@ -451,20 +656,19 @@ def _download_videos_by_script_order(
                 if saved_video_path:
                     logger.info(f"video saved: {saved_video_path}")
                     video_paths.append(saved_video_path)
-                    total_duration += min(max_clip_duration, item.duration)
-                    if total_duration > audio_duration:
-                        logger.info(
-                            f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
-                        )
-                        break
+                    clip_duration = min(max_clip_duration, item.duration)
+                    term_duration += clip_duration
+                    total_duration += clip_duration
+                    downloaded_for_term += 1
             except Exception as e:
                 logger.error(
                     f"failed to download ordered video: {utils.to_json(item)} => {str(e)}"
                 )
 
-        if not has_candidate:
-            break
-        candidate_index += 1
+        logger.info(
+            f"ordered scene '{search_term}' downloaded {downloaded_for_term} clips "
+            f"covering {term_duration:.1f} seconds"
+        )
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")
     return video_paths

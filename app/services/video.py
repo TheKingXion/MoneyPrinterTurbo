@@ -1,3 +1,4 @@
+import glob
 import itertools
 import io
 import os
@@ -7,11 +8,12 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from contextlib import ExitStack, redirect_stdout
+from contextlib import redirect_stdout
 from functools import lru_cache
 from typing import List
 from loguru import logger
 import numpy as np
+import cv2
 from moviepy import (
     AudioFileClip,
     ColorClip,
@@ -23,7 +25,7 @@ from moviepy import (
     afx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.config import config
 from app.models import const
@@ -34,8 +36,8 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import bgm as bgm_service
 from app.services.utils import video_effects
+from app.services import performance
 from app.utils import file_security, utils
 
 class SubClippedVideoClip:
@@ -73,12 +75,7 @@ fps = 30
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
-_MIN_MATERIAL_DIMENSION = 480
-# 消息类应用和部分编码器会把画面尺寸向下取整，例如 WhatsApp 会把 9:16 的
-# 素材压成 478x850，比 480 少两个像素。直接按 480 硬卡会让这类素材全部被
-# 丢弃，最终以 "no valid materials found" 整体失败。这里留一个很小的容差，
-# 既能放行仅仅因为取整而略低于阈值的素材，也仍然能挡住真正的低清素材。
-_MIN_DIMENSION_TOLERANCE = 10
+_BGM_EXTENSIONS = (".mp3",)
 _DEFAULT_VIDEO_CODEC = "libx264"
 _SUPPORTED_VIDEO_CODECS = (
     "libx264",
@@ -89,6 +86,62 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_videotoolbox",
 )
 _runtime_disabled_video_codecs = set()
+_VIDEO_FIT_MODES = ("cover", "blur", "contain")
+
+
+@lru_cache(maxsize=1)
+def _face_detector():
+    cascade_path = os.path.join(
+        cv2.data.haarcascades, "haarcascade_frontalface_default.xml"
+    )
+    return cv2.CascadeClassifier(cascade_path)
+
+
+def _smart_cover_clip(source_clip, video_width: int, video_height: int):
+    state = {"center": None, "last_detection": -1.0}
+
+    def transform_frame(get_frame, time):
+        frame = np.asarray(get_frame(time), dtype=np.uint8)
+        source_height, source_width = frame.shape[:2]
+        scale = max(video_width / source_width, video_height / source_height)
+        resized_width = max(video_width, int(round(source_width * scale)))
+        resized_height = max(video_height, int(round(source_height * scale)))
+        resized = cv2.resize(
+            frame, (resized_width, resized_height), interpolation=cv2.INTER_LANCZOS4
+        )
+
+        center = state["center"] or (resized_width / 2, resized_height / 2)
+        if time - state["last_detection"] >= 0.25:
+            detection_width = min(360, resized_width)
+            detection_scale = detection_width / resized_width
+            small = cv2.resize(
+                resized,
+                (detection_width, max(1, int(resized_height * detection_scale))),
+            )
+            gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+            faces = _face_detector().detectMultiScale(
+                gray, scaleFactor=1.12, minNeighbors=5, minSize=(28, 28)
+            )
+            if len(faces):
+                x, y, width, height = max(faces, key=lambda face: face[2] * face[3])
+                detected = (
+                    (x + width / 2) / detection_scale,
+                    (y + height / 2) / detection_scale,
+                )
+                center = (
+                    center[0] * 0.72 + detected[0] * 0.28,
+                    center[1] * 0.72 + detected[1] * 0.28,
+                )
+                state["center"] = center
+            state["last_detection"] = time
+
+        left = int(round(center[0] - video_width / 2))
+        top = int(round(center[1] - video_height / 2))
+        left = min(max(left, 0), resized_width - video_width)
+        top = min(max(top, 0), resized_height - video_height)
+        return resized[top : top + video_height, left : left + video_width]
+
+    return source_clip.transform(transform_frame)
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -102,15 +155,40 @@ def _get_required_video_duration(audio_duration: float) -> float:
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
 
 
-def is_material_resolution_acceptable(width: int, height: int) -> bool:
-    """
-    判断素材分辨率是否足够用于合成。
+def _fit_clip_to_canvas(clip, video_width: int, video_height: int, mode: str = "cover"):
+    """Fit a clip to the output canvas without changing its aspect ratio."""
+    mode = mode if mode in _VIDEO_FIT_MODES else "cover"
+    clip_width, clip_height = clip.size
+    if clip_width == video_width and clip_height == video_height:
+        return clip
 
-    标称最小值是 480x480，但允许比它低 `_MIN_DIMENSION_TOLERANCE` 个像素，
-    以兼容编码器/消息应用向下取整导致的尺寸（例如 WhatsApp 的 478x850）。
-    """
-    min_dimension = _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
-    return width >= min_dimension and height >= min_dimension
+    cover_scale = max(video_width / clip_width, video_height / clip_height)
+    contain_scale = min(video_width / clip_width, video_height / clip_height)
+
+    def cover(source_clip):
+        return _smart_cover_clip(source_clip, video_width, video_height)
+
+    if mode == "cover":
+        return cover(clip)
+
+    foreground = clip.resized(contain_scale).with_position("center")
+    if mode == "contain":
+        background = ColorClip(
+            size=(video_width, video_height), color=(0, 0, 0)
+        ).with_duration(clip.duration)
+        return CompositeVideoClip([background, foreground], size=(video_width, video_height))
+
+    def blur_frame(frame):
+        image = Image.fromarray(frame.astype("uint8"))
+        return np.asarray(image.filter(ImageFilter.GaussianBlur(radius=24)))
+
+    background = cover(clip).image_transform(blur_frame)
+    background = background.image_transform(
+        lambda frame: np.clip(frame.astype(np.float32) * 0.72, 0, 255).astype(np.uint8)
+    )
+    return CompositeVideoClip(
+        [background, foreground], size=(video_width, video_height)
+    )
 
 
 def _prioritize_unique_source_clips(
@@ -175,6 +253,8 @@ def _get_configured_video_codec() -> str:
     编码。这里刻意只允许固定白名单，避免开放任意 FFmpeg 参数后，用户填错
     参数导致输出格式不可控，甚至让生成任务在后续阶段才失败。
     """
+    if str(config.app.get("performance_mode", "auto")).strip().lower() == "auto":
+        return performance.get_runtime_profile().h264_codec
     configured_codec = str(
         config.app.get("video_codec", _DEFAULT_VIDEO_CODEC) or _DEFAULT_VIDEO_CODEC
     ).strip()
@@ -353,11 +433,16 @@ def concat_video_clips_with_ffmpeg(
             concat_list_file,
             "-c:v",
             codec,
-            "-threads",
-            str(threads or 2),
-            "-pix_fmt",
-            "yuv420p",
         ]
+        if codec != "copy":
+            command.extend(
+                [
+                    "-threads",
+                    str(threads or 2),
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            )
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(output_file)
@@ -365,8 +450,7 @@ def concat_video_clips_with_ffmpeg(
 
     def run_concat(codec: str):
         command = build_command(codec)
-        # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
-        # 从而降低画质劣化与颜色偏移风险。
+        # 使用 ffmpeg 一次完成串联；快速路径只封装码流，兜底路径才重新编码。
         result = subprocess.run(
             command,
             capture_output=True,
@@ -379,6 +463,16 @@ def concat_video_clips_with_ffmpeg(
         return codec
 
     try:
+        try:
+            # Temp clips are normalized to the same codec, FPS, canvas and pixel
+            # format before this point, so avoid encoding them a second time.
+            return run_concat("copy")
+        except Exception as exc:
+            logger.warning(
+                "ffmpeg stream-copy concat failed, falling back to re-encode: "
+                f"{str(exc)}"
+            )
+
         effective_codec = _get_effective_video_codec()
         try:
             return run_concat(effective_codec)
@@ -498,27 +592,57 @@ def delete_files(files: List[str] | str):
             logger.debug(f"failed to delete file {file}: {str(e)}")
 
 
+def _resolve_bgm_file_path(song_dir: str, bgm_file: str) -> str:
+    # 背景音乐只允许读取 resource/songs 目录内的文件，避免用户输入任意路径后
+    # 被 MoviePy 打开。这里兼容两种常见输入：
+    # 1. output000.mp3：来自 BGM 列表或用户只填写文件名
+    # 2. ./resource/songs/output000.mp3：用户按项目目录结构填写的相对路径
+    # 两种写法最终都会再次通过 resource/songs 白名单校验，不能绕过目录限制。
+    try:
+        return file_security.resolve_path_within_directory(song_dir, bgm_file)
+    except ValueError as song_dir_exc:
+        if os.path.isabs(bgm_file):
+            raise song_dir_exc
+
+        project_relative_file = os.path.join(utils.root_dir(), bgm_file)
+        try:
+            return file_security.resolve_path_within_directory(
+                song_dir, project_relative_file
+            )
+        except ValueError as root_dir_exc:
+            raise ValueError(str(root_dir_exc)) from song_dir_exc
+
+
 def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if not bgm_type:
         return ""
 
     if bgm_file:
+        song_dir = utils.song_dir()
         try:
-            resolved_bgm_file = bgm_service.resolve_bgm_file(bgm_file)
+            resolved_bgm_file = _resolve_bgm_file_path(song_dir, bgm_file)
         except ValueError as exc:
-            # API 请求里的 bgm_file 来自用户输入，只允许解析到用户 BGM 或内置
-            # 歌曲目录，阻止 MoviePy 读取配置、密钥等任意服务器文件。
+            # API 请求里的 bgm_file 来自用户输入，不能直接把任意绝对路径交给
+            # MoviePy 打开。这里强制限制到 resource/songs 目录，阻止读取
+            # /etc/passwd、配置文件、密钥等非背景音乐文件。
             logger.warning(
-                f"reject unsafe bgm file: {bgm_file}, error: {str(exc)}"
+                f"reject unsafe bgm file: {bgm_file}, song_dir: {song_dir}, error: {str(exc)}"
             )
             return ""
+
+        if not resolved_bgm_file.lower().endswith(_BGM_EXTENSIONS):
+            logger.warning(f"reject unsupported bgm file extension: {resolved_bgm_file}")
+            return ""
+
         return resolved_bgm_file
 
     if bgm_type == "random":
-        files = bgm_service.list_bgm_files()
+        suffix = "*.mp3"
+        song_dir = utils.song_dir()
+        files = glob.glob(os.path.join(song_dir, suffix))
         # 当背景音乐目录为空时，直接回退为“不使用 BGM”，避免 random.choice([]) 抛异常。
         if not files:
-            logger.warning("no background music files found")
+            logger.warning(f"no bgm files found in song directory: {song_dir}")
             return ""
         return random.choice(files)
 
@@ -530,11 +654,11 @@ def combine_videos(
     video_paths: List[str],
     audio_file: str,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    video_fit_mode: str = "cover",
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
-    clip_speed: float = 1.0,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -553,17 +677,6 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
-    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
-    if normalized_clip_speed != 1.0:
-        # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
-        # 也避免在逐片段热路径中重复输出相同日志。
-        logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
-    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
-    # MoviePy 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放
-    # 6 秒源画面同样会得到 3 秒片段。因此切片前必须按速度反推源时长；如果
-    # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
-    # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
-    source_clip_duration = max_clip_duration * normalized_clip_speed
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
@@ -572,6 +685,7 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
+    sequential_offsets = {}
     for video_path in video_paths:
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
@@ -579,9 +693,13 @@ def combine_videos(
         close_clip(clip)
         
         start_time = 0
+        if video_concat_mode.value == VideoConcatMode.sequential.value:
+            start_time = sequential_offsets.get(video_path, 0)
+            if start_time >= clip_duration:
+                start_time = 0
 
         while start_time < clip_duration:
-            end_time = min(start_time + source_clip_duration, clip_duration)
+            end_time = min(start_time + max_clip_duration, clip_duration)
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
@@ -600,6 +718,7 @@ def combine_videos(
 
             start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
+                sequential_offsets[video_path] = end_time
                 break
 
     subclipped_items = _prioritize_unique_source_clips(
@@ -625,33 +744,16 @@ def combine_videos(
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
             )
-            # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
-            # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
-            # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
-            if normalized_clip_speed != 1.0:
-                clip = clip.with_speed_scaled(normalized_clip_speed)
             clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
+            # Fit mixed portrait/landscape sources to the requested canvas.
             clip_w, clip_h = clip.size
             if clip_w != video_width or clip_h != video_height:
                 clip_ratio = clip.w / clip.h
                 video_ratio = video_width / video_height
                 logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
+                clip = _fit_clip_to_canvas(
+                    clip, video_width, video_height, video_fit_mode
+                )
                     
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
             if transition_value in (None, VideoTransitionMode.none.value):
@@ -664,18 +766,12 @@ def combine_videos(
                 clip = video_effects.slidein_transition(clip, 1, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
                 clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
                     lambda c: video_effects.fadein_transition(c, 1),
                     lambda c: video_effects.fadeout_transition(c, 1),
                     lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
                     lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
@@ -903,7 +999,7 @@ def _get_visible_center_position(
 
 
 def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
-    """判断字幕文字和背景是否同色，提醒用户可能无法看清字幕。"""
+    """Return whether enabled subtitle text and background use the same color."""
     if not params.subtitle_enabled or not params.text_background_color:
         return False
 
@@ -919,7 +1015,7 @@ def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
 
 @lru_cache(maxsize=64)
 def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
-    """检查字体是否包含样本文字需要的字形，并缓存重复检查结果。"""
+    """Check a representative text sample for missing font glyphs."""
     try:
         font = ImageFont.truetype(font_path, 30)
         missing_mask = font.getmask("\U0010ffff")
@@ -938,14 +1034,14 @@ def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
             if char_mask.getbbox() is None or char_signature == missing_signature:
                 return False
         return True
-    except Exception as e:
-        # 字体探测失败不应阻止用户生成；保留日志供环境兼容问题排查。
-        logger.warning(f"failed to inspect subtitle font glyphs: {font_path}, {e}")
+    except Exception as exc:
+        # Font inspection is advisory and must not block rendering on unusual hosts.
+        logger.warning(f"failed to inspect subtitle font glyphs: {font_path}, {exc}")
         return True
 
 
 def subtitle_font_supports_text(font_path: str, text: str) -> bool:
-    """检查字体能否绘制文本中的字母和数字，忽略空白及标点符号。"""
+    """Check letters and numbers while ignoring whitespace and punctuation."""
     sample = "".join(
         dict.fromkeys(
             char
@@ -964,15 +1060,7 @@ def generate_video(
     subtitle_path: str,
     output_file: str,
     params: VideoParams,
-    bgm_file_override: str | None = None,
-) -> bool:
-    """
-    合成最终视频，并返回本次背景音乐处理是否成功。
-
-    返回值只描述 BGM 处理状态：没有请求 BGM 或成功混合时返回 True；请求了
-    BGM 但加载、特效或混合失败时返回 False。即使 BGM 失败仍会继续输出只有
-    旁白的视频，让任务编排层决定是否向用户展示降级警告。
-    """
+):
     aspect = VideoAspect(params.video_aspect)
     video_width, video_height = aspect.to_resolution()
 
@@ -1015,8 +1103,6 @@ def generate_video(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
         has_subtitle_background = bool(bg_color)
-        # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
-        # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
         padding_ratio = 0.4 if rounded_bg_enabled else 0.6
         pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
         # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
@@ -1155,106 +1241,60 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
-    # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
-    # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
-    # 视频写入失败等路径都能释放 FFmpeg 子进程，尤其避免 Windows 文件被占用。
-    with ExitStack() as clip_stack:
-        source_video_clip = clip_stack.enter_context(
-            _open_video_clip_quietly(video_path)
+    video_clip = _open_video_clip_quietly(video_path)
+    audio_clip = AudioFileClip(audio_path).with_effects(
+        [afx.MultiplyVolume(params.voice_volume)]
+    )
+
+    def make_textclip(text):
+        return TextClip(
+            text=text,
+            font=font_path,
+            font_size=params.font_size,
         )
-        voice_source_clip = clip_stack.enter_context(AudioFileClip(audio_path))
-        video_clip = source_video_clip
-        audio_clip = voice_source_clip.with_effects(
-            [afx.MultiplyVolume(params.voice_volume)]
+
+    if subtitle_path and os.path.exists(subtitle_path):
+        sub = SubtitlesClip(
+            subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
         )
+        text_clips = []
+        for item in sub.subtitles:
+            clip = create_text_clip(subtitle_item=item)
+            text_clips.append(clip)
+        video_clip = CompositeVideoClip([video_clip, *text_clips])
 
-        def make_textclip(text):
-            return TextClip(
-                text=text,
-                font=font_path,
-                font_size=params.font_size,
-            )
-
-        if subtitle_path and os.path.exists(subtitle_path):
-            sub = clip_stack.enter_context(
-                SubtitlesClip(
-                    subtitles=subtitle_path,
-                    encoding="utf-8",
-                    make_textclip=make_textclip,
-                )
-            )
-            text_clips = []
-            for item in sub.subtitles:
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
-            video_clip = CompositeVideoClip([video_clip, *text_clips])
-            clip_stack.callback(video_clip.close)
-
-        bgm_enabled = bgm_service.should_use_bgm(
-            params.bgm_type, params.bgm_volume
-        )
-        if not bgm_enabled and params.bgm_type:
-            # 所有 BGM 来源共用这一条短路规则。音量不大于 0 时不能解析随机或
-            # 自定义文件，也不能加载提供商返回的文件，避免无意义的 IO 和混音。
-            logger.info(
-                f"skipping background music because volume is not positive: "
-                f"type={params.bgm_type}, volume={params.bgm_volume}"
-            )
-
-        # 提供商配乐可由任务编排层直接传入对应文件。None 表示沿用随机/自定义
-        # BGM 解析，空字符串明确禁用本条 BGM；但任何来源都必须先通过通用音量规则。
-        bgm_file = ""
-        if bgm_enabled:
-            bgm_file = (
-                bgm_file_override
-                if bgm_file_override is not None
-                else get_bgm_file(
-                    bgm_type=params.bgm_type,
-                    bgm_file=params.bgm_file,
-                )
-            )
-        bgm_mix_succeeded = True
-        if bgm_file:
-            try:
-                bgm_effects = [
+    bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+    if bgm_file:
+        try:
+            bgm_clip = AudioFileClip(bgm_file).with_effects(
+                [
                     afx.MultiplyVolume(params.bgm_volume),
                     afx.AudioFadeOut(3),
+                    afx.AudioLoop(duration=video_clip.duration),
                 ]
-                # 服务内解析的随机/自定义音乐可能比成片短，需要循环铺满；任务层
-                # 通过 override 传入的文件表示提供商已经完成时长适配。这里依据
-                # 文件来源决定是否循环，避免今后每增加一个提供商都修改名称白名单。
-                if bgm_file_override is None:
-                    bgm_effects.append(afx.AudioLoop(duration=video_clip.duration))
-                bgm_source_clip = clip_stack.enter_context(AudioFileClip(bgm_file))
-                bgm_clip = bgm_source_clip.with_effects(bgm_effects)
-                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-            except Exception:
-                bgm_mix_succeeded = False
-                # 记录完整堆栈和稳定上下文，便于区分文件解码、MoviePy 特效和
-                # CompositeAudioClip 失败；文件内容与 API Key 不会进入日志。
-                logger.exception(
-                    f"failed to mix background music: type={params.bgm_type}, "
-                    f"file={bgm_file}"
-                )
+            )
+            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+        except Exception as e:
+            logger.error(f"failed to add bgm: {str(e)}")
 
-        final_video_clip = video_clip.with_audio(audio_clip)
-        clip_stack.callback(final_video_clip.close)
-        # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
-        # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
-        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-        _write_videofile_with_codec_fallback(
-            final_video_clip,
-            output_file=output_file,
-            codec=_get_configured_video_codec(),
-            audio_codec=audio_codec,
-            audio_fps=output_audio_fps,
-            audio_bitrate=audio_bitrate,
-            temp_audiofile_path=_get_temp_audio_dir(output_dir),
-            threads=params.n_threads or 2,
-            logger=None,
-            fps=fps,
-        )
-        return bgm_mix_succeeded
+    video_clip = video_clip.with_audio(audio_clip)
+    # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
+    # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
+    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+    _write_videofile_with_codec_fallback(
+        video_clip,
+        output_file=output_file,
+        codec=_get_configured_video_codec(),
+        audio_codec=audio_codec,
+        audio_fps=output_audio_fps,
+        audio_bitrate=audio_bitrate,
+        temp_audiofile_path=_get_temp_audio_dir(output_dir),
+        threads=params.n_threads or 2,
+        logger=None,
+        fps=fps,
+    )
+    video_clip.close()
+    del video_clip
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -1307,12 +1347,8 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
         try:
             width = clip.size[0]
             height = clip.size[1]
-            if not is_material_resolution_acceptable(width, height):
-                logger.warning(
-                    f"low resolution material: {width}x{height}, minimum "
-                    f"{_MIN_MATERIAL_DIMENSION}x{_MIN_MATERIAL_DIMENSION} required "
-                    f"(tolerance {_MIN_DIMENSION_TOLERANCE}px)"
-                )
+            if width < 480 or height < 480:
+                logger.warning(f"low resolution material: {width}x{height}, minimum 480x480 required")
                 # 探测到低分辨率素材后立即关闭资源，并且不要把该素材返回给后续流程。
                 close_clip(clip)
                 continue

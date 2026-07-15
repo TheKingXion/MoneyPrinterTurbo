@@ -9,6 +9,7 @@ openai==2.24.0
 faster-whisper==1.1.0
 loguru==0.7.3
 google-genai==2.11.0
+tzlocal==5.3.1
 dashscope==1.20.14
 azure-cognitiveservices-speech==1.41.1
 redis==5.2.0
@@ -19,3 +20,11 @@ socksio==1.0.0
 pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
+google-api-python-client>=2.150.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
+optimum-onnx[onnxruntime]>=0.1.0
+opencv-python-headless==4.11.0.86
+
+# Optional unofficial g4f provider is intentionally not installed by default.
+# Use `uv sync --extra g4f` only when you explicitly accept that provider risk.
