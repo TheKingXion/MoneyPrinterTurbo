@@ -62,7 +62,7 @@ def _render_settings(tr) -> None:
         schedule_at = st.text_input(tr("Schedule Time"), config.tiktok.get("schedule_at", "21:00"), key="tt_settings_time")
         schedule_interval_minutes = st.number_input(tr("Schedule Interval Minutes"), 1, 240, int(config.tiktok.get("schedule_interval_minutes", 30)), key="tt_settings_interval")
         daily_upload_limit = st.number_input(tr("Local Daily Upload Limit"), 1, 100, int(config.tiktok.get("daily_upload_limit", 10)), key="tt_settings_limit")
-        if st.button(tr("Save TikTok Settings"), key="tt_settings_save", type="primary", use_container_width=True):
+        if st.button(tr("Save TikTok Settings"), key="tt_settings_save", type="primary", width="stretch"):
             config.tiktok.update({
                 "provider": provider,
                 "client_key": client_key,
@@ -165,8 +165,8 @@ def _render_scanner(tr, batch=False, base_params=None) -> None:
         )
         schedule_batch = st.checkbox(tr("Schedule uploads"), True, key="tt_batch_schedule")
         subjects = [line.strip() for line in subjects_text.splitlines() if line.strip()][:count]
-        st.dataframe([{"#": i + 1, tr("Video Subject"): subject} for i, subject in enumerate(subjects)], hide_index=True, use_container_width=True)
-        if st.button(tr("Start TikTok Batch"), key="tt_batch_start", type="primary", use_container_width=True, disabled=not subjects):
+        st.dataframe([{"#": i + 1, tr("Video Subject"): subject} for i, subject in enumerate(subjects)], hide_index=True, width="stretch")
+        if st.button(tr("Start TikTok Batch"), key="tt_batch_start", type="primary", width="stretch", disabled=not subjects):
             if not _preflight(tr, len(subjects)):
                 return
             queue_size = _active_pending_jobs()
@@ -257,4 +257,4 @@ def render(tr, base_params) -> None:
             _render_queue(tr)
         with log:
             entries = tiktok_upload_tracker.load()
-            st.dataframe(entries, hide_index=True, use_container_width=True) if entries else st.info(tr("No TikTok uploads yet"))
+            st.dataframe(entries, hide_index=True, width="stretch") if entries else st.info(tr("No TikTok uploads yet"))

@@ -760,7 +760,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         play_label,
                         key=f"play_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/play_arrow:",
                         help=play_label,
                         disabled=not has_video,
@@ -772,7 +772,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         open_label,
                         key=f"open_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/folder_open:",
                         help=open_label,
                     ):
@@ -783,7 +783,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         restore_label,
                         key=f"restore_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/replay:",
                         help=restore_label,
                         disabled=is_processing or not has_restore_data,
@@ -800,7 +800,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         delete_label,
                         key=f"delete_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/delete:",
                         help=delete_help,
                         disabled=is_processing,
@@ -1059,7 +1059,7 @@ def _render_task_restore_dialog(task_id):
     if cancel_col.button(
         tr("Cancel"),
         key="cancel_task_restore",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state.pop("task_restore_candidate_id", None)
         st.rerun(scope="app")
@@ -1067,7 +1067,7 @@ def _render_task_restore_dialog(task_id):
         tr("Load Task Configuration"),
         key="confirm_task_restore",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state["task_restore_payload"] = payload
         st.session_state.pop("task_restore_candidate_id", None)
@@ -1667,7 +1667,7 @@ def _render_cache_management_settings(panel):
         if refresh_col.button(
             tr("Refresh Cache Stats"),
             key="refresh_video_cache_stats",
-            use_container_width=True,
+            width="stretch",
             icon=":material/refresh:",
         ):
             _get_video_cache_stats.clear()
@@ -1676,7 +1676,7 @@ def _render_cache_management_settings(panel):
         if open_col.button(
             tr("Open Cache Directory"),
             key="open_video_cache_directory",
-            use_container_width=True,
+            width="stretch",
             icon=":material/folder_open:",
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
@@ -1687,7 +1687,7 @@ def _render_cache_management_settings(panel):
             key="clean_video_cache_now",
             type="primary",
             disabled=cleanup_disabled,
-            use_container_width=True,
+            width="stretch",
             icon=":material/delete_sweep:",
         ):
             result = cache_manager.clean_video_cache(max_age_days=max_age_days)
@@ -1912,7 +1912,7 @@ def _render_settings_dialog():
             if llm_form_panel.button(
                 tr("Test LLM Connection"),
                 key="test_llm_connection_button",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/network_check:",
             ):
@@ -2039,14 +2039,14 @@ def _render_script_settings(panel, params):
                         key="restore_default_system_prompt",
                         icon=":material/restart_alt:",
                         on_click=reset_script_system_prompt,
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         st.toast(tr("Default System Prompt Restored"))
                     if preview_prompt_col.button(
                         tr("Preview Final Prompt"),
                         key="preview_final_script_prompt",
                         icon=":material/preview:",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         render_script_prompt_preview(
                             llm.build_script_prompt(
@@ -2061,7 +2061,7 @@ def _render_script_settings(panel, params):
             if st.button(
                 tr("Generate Video Script and Keywords"),
                 key="auto_generate_script",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -2101,7 +2101,7 @@ def _render_script_settings(panel, params):
             if st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -2516,7 +2516,7 @@ def _render_background_music_settings(params):
         if st.button(
             tr("Test Sonilo Connection"),
             key="test_sonilo_connection_button",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 sonilo_service.test_connection()
@@ -3165,7 +3165,7 @@ def _render_subtitle_settings(panel, params):
                 key="restore_default_subtitle_settings",
                 icon=":material/restart_alt:",
                 on_click=reset_subtitle_settings,
-                use_container_width=True,
+                width="stretch",
             ):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
@@ -3200,7 +3200,7 @@ def _render_generation_controls(
 
     start_button = st.button(
         tr("Generate Video"),
-        use_container_width=True,
+        width="stretch",
         type="primary",
         key="generate_video_button",
         on_click=_prepare_generation_task,

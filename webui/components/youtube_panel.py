@@ -72,7 +72,7 @@ def _status_counts(batch: dict) -> dict:
 
 
 @st.fragment(run_every="2s")
-def _render_progress(tr, batch_id: str) -> None:
+def _render_progress(tr, batch_id: str, instance: str) -> None:
     batch = youtube_batch_store.load(batch_id)
     if not batch:
         st.warning("Batch manifest is unavailable")
@@ -87,16 +87,17 @@ def _render_progress(tr, batch_id: str) -> None:
     metrics[3].metric(tr("Status"), batch.get("status", "pending"))
     controls = st.columns(4)
     control = batch.get("control", "running")
-    if controls[0].button(tr("Pause"), key=f"yt_batch_pause_{batch_id}", disabled=control != "running"):
+    key_suffix = f"{instance}_{batch_id}"
+    if controls[0].button(tr("Pause"), key=f"yt_batch_pause_{key_suffix}", disabled=control != "running"):
         youtube_batch_runner.pause(batch_id)
         st.rerun(scope="fragment")
-    if controls[1].button(tr("Resume"), key=f"yt_batch_resume_{batch_id}", disabled=control != "paused"):
+    if controls[1].button(tr("Resume"), key=f"yt_batch_resume_{key_suffix}", disabled=control != "paused"):
         youtube_batch_runner.start(batch_id, explicit_resume=True)
         st.rerun(scope="fragment")
-    if controls[2].button(tr("Retry"), key=f"yt_batch_retry_{batch_id}"):
+    if controls[2].button(tr("Retry"), key=f"yt_batch_retry_{key_suffix}"):
         youtube_batch_runner.retry(batch_id)
         st.rerun(scope="fragment")
-    if controls[3].button(tr("Cancel"), key=f"yt_batch_cancel_{batch_id}", disabled=control == "cancelled"):
+    if controls[3].button(tr("Cancel"), key=f"yt_batch_cancel_{key_suffix}", disabled=control == "cancelled"):
         youtube_batch_runner.cancel(batch_id)
         st.rerun(scope="fragment")
     st.dataframe(
@@ -110,7 +111,7 @@ def _render_progress(tr, batch_id: str) -> None:
             tr("Failed"): item.get("error", ""),
         } for item in batch.get("items", [])],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -141,7 +142,7 @@ def _render_settings(tr) -> None:
             key="yt_settings_privacy",
         )
         daily_api_limit = st.number_input(tr("Daily API Upload Limit"), 1, 100, int(config.youtube.get("daily_api_limit", 7)), key="yt_settings_daily_limit")
-        if st.button(tr("Save YouTube Settings"), key="yt_settings_save", type="primary", use_container_width=True):
+        if st.button(tr("Save YouTube Settings"), key="yt_settings_save", type="primary", width="stretch"):
             config.youtube.update({
                 "client_id": client_id,
                 "client_secret": client_secret,
@@ -233,7 +234,7 @@ def _render_batch_history(tr) -> None:
         placeholder=tr("None"),
     ) if recent else None
     if selected_id:
-        _render_progress(tr, selected_id)
+        _render_progress(tr, selected_id, "history")
     elif not recent:
         st.info(tr("None"))
 
@@ -274,7 +275,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
             # here before any widgets are instantiated.
             _clear_batch_draft(st.session_state)
             st.success(f"{tr('Batch in progress...')} {active_batch_id}")
-            _render_progress(tr, active_batch_id)
+            _render_progress(tr, active_batch_id, "active")
             if st.button(tr("Prepare batch ideas"), key="yt_batch_prepare_another"):
                 st.session_state.pop("yt_active_batch_id", None)
                 _clear_batch_draft(st.session_state)
@@ -357,7 +358,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
         },
         num_rows="dynamic",
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key="yt_batch_idea_editor",
     )
     st.session_state["yt_batch_idea_rows"] = edited_rows
@@ -387,7 +388,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
                 for index, quality in enumerate(quality_rows)
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     st.markdown(f"### 2. {tr('Configure batch videos')}")
@@ -496,7 +497,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
             tr("Publishing Title"): title_overrides[index] or tr("Auto Detect"),
             tr("Schedule Time"): f"{plan[index].get('local_date', '')} {plan[index].get('local_time', '')}",
         })
-    st.dataframe(preview, hide_index=True, use_container_width=True)
+    st.dataframe(preview, hide_index=True, width="stretch")
     low_quality_rows = [quality for quality in quality_rows if quality["status"] != "approved"]
     ready = (
         len(subjects) == total
@@ -504,7 +505,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
         and not duplicate_rows
         and not low_quality_rows
     )
-    if st.button(tr("Start Batch"), key="yt_batch_start", type="primary", use_container_width=True, disabled=not ready):
+    if st.button(tr("Start Batch"), key="yt_batch_start", type="primary", width="stretch", disabled=not ready):
         if not _preflight(tr):
             return
         params = _build_batch_video_params(
@@ -559,4 +560,4 @@ def render(tr, base_params: VideoParams) -> None:
             _render_scanner(tr)
         with log:
             entries = upload_tracker.load()
-            st.dataframe(entries, hide_index=True, use_container_width=True) if entries else st.info(tr("No YouTube uploads yet"))
+            st.dataframe(entries, hide_index=True, width="stretch") if entries else st.info(tr("No YouTube uploads yet"))

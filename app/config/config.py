@@ -301,7 +301,7 @@ project_description = _cfg.get(
     "<a href='https://github.com/harry0703/MoneyPrinterTurbo'>https://github.com/harry0703/MoneyPrinterTurbo</a>"
     "<br><small>Supported by <a href='https://aihubmix.com/?aff=CEve'>AIHubMix</a></small>",
 )
-project_version = "1.3.2+custom.3"
+project_version = "1.3.2+custom.4"
 reload_debug = False
 
 app["redis_host"] = os.getenv(

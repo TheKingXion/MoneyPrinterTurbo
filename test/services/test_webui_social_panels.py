@@ -8,6 +8,29 @@ from webui.components import tiktok_panel, youtube_panel
 
 
 class TestSocialPanelRuntime(unittest.TestCase):
+    def test_youtube_progress_can_render_active_batch_and_history(self):
+        app = AppTest.from_string(
+            """
+from unittest.mock import patch
+from webui.components import youtube_panel
+
+batch = {
+    "batch_id": "batch-123",
+    "requested": 1,
+    "status": "running",
+    "control": "running",
+    "items": [],
+}
+with patch.object(youtube_panel.youtube_batch_store, "load", return_value=batch):
+    youtube_panel._render_progress(lambda value: value, "batch-123", "active")
+    youtube_panel._render_progress(lambda value: value, "batch-123", "history")
+"""
+        ).run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIsNotNone(app.button(key="yt_batch_pause_active_batch-123"))
+        self.assertIsNotNone(app.button(key="yt_batch_pause_history_batch-123"))
+
     def test_youtube_batch_renders_instruction_defaults(self):
         app = AppTest.from_string(
             """

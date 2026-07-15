@@ -37,7 +37,7 @@ def render(tr, subject: str, script: str, language: str) -> None:
         if st.button(
             tr("Generate Publishing Description"),
             key="social_metadata_generate",
-            use_container_width=True,
+            width="stretch",
         ):
             if not subject and not script:
                 st.error(tr("Video Script and Subject Cannot Both Be Empty"))

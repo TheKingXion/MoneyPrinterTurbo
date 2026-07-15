@@ -5,6 +5,20 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.4] - 2026-07-15
+
+### Changed
+
+- Replaced Streamlit's removed `use_container_width` argument with the current
+  `width="stretch"` API throughout the WebUI.
+- Advanced the fork version from `1.3.2+custom.3` to `1.3.2+custom.4`.
+
+### Fixed
+
+- YouTube batch progress controls now use separate widget keys in the active
+  generator and batch history views, preventing repeated fragment refreshes
+  from crashing the WebUI with `StreamlitDuplicateElementKey`.
+
 ## [1.3.2+custom.3] - 2026-07-15
 
 ### Added

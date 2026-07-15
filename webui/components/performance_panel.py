@@ -60,7 +60,7 @@ def render(tr) -> None:
                     for gpu in hardware.gpus
                 ],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
         st.caption(
@@ -105,5 +105,5 @@ def render(tr) -> None:
                     for row in stages
                 ],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
