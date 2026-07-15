@@ -31,6 +31,7 @@ from app.models.schema import (
     VideoMaterialRetrieveResponse
 )
 from app.services import bgm as bgm_service
+from app.services import performance
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import file_security, utils
@@ -44,7 +45,14 @@ _redis_host = config.app.get("redis_host", "localhost")
 _redis_port = config.app.get("redis_port", 6379)
 _redis_db = config.app.get("redis_db", 0)
 _redis_password = config.app.get("redis_password", None)
-_max_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
+_configured_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
+_max_concurrent_tasks = (
+    performance.recommended_task_slots(
+        performance.detect_hardware(), _configured_concurrent_tasks
+    )
+    if str(config.app.get("performance_mode", "auto")).strip().lower() == "auto"
+    else _configured_concurrent_tasks
+)
 _max_queued_tasks = config.app.get("max_queued_tasks", 100)
 
 redis_url = f"redis://:{_redis_password}@{_redis_host}:{_redis_port}/{_redis_db}"

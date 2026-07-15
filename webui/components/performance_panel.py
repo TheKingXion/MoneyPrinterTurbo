@@ -65,8 +65,28 @@ def render(tr) -> None:
 
         st.caption(
             f"Automático adaptativo · {profile.render_slots} render simultáneo(s) · "
-            f"{profile.ffmpeg_threads} hilos FFmpeg · {profile.network_slots} trabajos de red"
+            f"{profile.ffmpeg_threads} hilos FFmpeg · {profile.network_slots} trabajos de red · "
+            f"{profile.task_slots} tareas activas"
         )
+        st.caption(
+            f"Selección: {profile.selection_reason} · Reserva RAM: "
+            f"{_gib(profile.ram_reserve_bytes)} · RAM estimada/render: "
+            f"{_gib(profile.estimated_ram_per_render)}"
+        )
+        if hardware.is_laptop:
+            power = "corriente" if hardware.power_plugged else "batería"
+            st.caption(f"Portátil detectado · alimentación: {power}")
+        benchmark_rows = [
+            {
+                tr("Encoder"): codec,
+                tr("Status"): "OK" if result.supported else tr("Failed"),
+                "FPS": round(float(result.encoded_fps or 0), 1) if result.supported else 0,
+                "Tiempo (s)": round(float(result.elapsed_seconds or 0), 2),
+            }
+            for codec, result in profile.encoder_benchmarks.items()
+        ]
+        if benchmark_rows:
+            st.dataframe(benchmark_rows, hide_index=True, width="stretch")
         if profile.disk_low:
             st.warning("El espacio libre es bajo; limpia la caché antes de ejecutar lotes grandes.")
 
@@ -85,11 +105,15 @@ def render(tr) -> None:
             )
         resource = telemetry.latest_resource_sample()
         if resource:
-            live = st.columns(4)
+            live = st.columns(6)
             live[0].metric(tr("Process CPU"), _percent(resource.get("cpu_percent")))
-            live[1].metric(tr("Process RAM"), _gib(resource.get("rss_bytes")))
-            live[2].metric("GPU", _percent(resource.get("gpu_percent")))
-            live[3].metric(tr("Used VRAM"), _gib(resource.get("gpu_memory_used")))
+            live[1].metric("CPU total", _percent(resource.get("system_cpu_percent")))
+            live[2].metric("CPU MHz", f"{float(resource.get('cpu_frequency_mhz') or 0):.0f}")
+            live[3].metric(tr("Process RAM"), _gib(resource.get("rss_bytes")))
+            live[4].metric("GPU", _percent(resource.get("gpu_percent")))
+            live[5].metric(tr("Used VRAM"), _gib(resource.get("gpu_memory_used")))
+            if resource.get("gpu_temperature_c") is not None:
+                st.caption(f"GPU: {_temperature(resource.get('gpu_temperature_c'))}")
 
         stages = telemetry.aggregate_stage_timings()
         if stages:

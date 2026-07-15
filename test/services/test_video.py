@@ -293,6 +293,63 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(fake_clip.codecs, ["h264_nvenc", "libx264"])
         self.assertIn("h264_nvenc", vd._runtime_disabled_video_codecs)
 
+    def test_write_videofile_uses_amf_speed_preset_and_yuv420p(self):
+        class _FakeClip:
+            def __init__(self):
+                self.kwargs = None
+
+            def write_videofile(self, output_file, codec, **kwargs):
+                self.kwargs = {"codec": codec, **kwargs}
+
+        fake_clip = _FakeClip()
+        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+            used_codec = vd._write_videofile_with_codec_fallback(
+                fake_clip,
+                "/tmp/fake.mp4",
+                codec="h264_amf",
+                logger=None,
+                fps=30,
+            )
+
+        self.assertEqual(used_codec, "h264_amf")
+        self.assertEqual(fake_clip.kwargs["preset"], "speed")
+        self.assertEqual(fake_clip.kwargs["ffmpeg_params"][-2:], ["-pix_fmt", "yuv420p"])
+
+    def test_generate_video_stream_copies_when_effects_are_disabled(self):
+        params = types.SimpleNamespace(
+            video_aspect="9:16",
+            subtitle_enabled=False,
+            bgm_type="",
+            voice_volume=0.8,
+        )
+        with patch.object(vd, "_mux_video_with_audio_copy") as mux:
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="audio.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        self.assertTrue(result)
+        mux.assert_called_once_with(
+            "combined.mp4", "audio.mp3", "final.mp4", 0.8
+        )
+
+    def test_audio_mux_copies_video_and_applies_volume(self):
+        completed_process = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(vd.utils, "get_ffmpeg_binary", return_value="ffmpeg"):
+            with patch.object(
+                vd.subprocess, "run", return_value=completed_process
+            ) as run:
+                vd._mux_video_with_audio_copy(
+                    "combined.mp4", "audio.mp3", "final.mp4", 0.75
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertEqual(command[command.index("-af") + 1], "volume=0.7500")
+
     def test_write_videofile_does_not_disable_codec_when_fallback_also_fails(self):
         """
         如果 libx264 兜底也失败，失败原因更可能是输出路径、权限、文件占用等

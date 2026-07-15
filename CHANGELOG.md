@@ -5,6 +5,33 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.5] - 2026-07-15
+
+### Added
+
+- Representative 1080x1920 encoder benchmarks with audio, measured FPS, error
+  reporting, and cache invalidation when hardware, drivers, or FFmpeg change.
+- Adaptive task and render concurrency based on RAM, VRAM, GPU temperature,
+  laptop power state, CPU topology, and live resource pressure.
+- System CPU, effective CPU frequency, and GPU temperature telemetry.
+
+### Changed
+
+- Native vendor encoders are selected by measured stability and speed instead
+  of relying on FFmpeg's advertised encoder list or a tiny synthetic probe.
+- FFmpeg thread limits and whole-pipeline concurrency now scale across low-RAM
+  desktops, high-memory workstations, and battery-powered laptops.
+- Videos without subtitles or background music attach narration with stream
+  copy instead of performing a redundant final video encode.
+- Advanced the fork version from `1.3.2+custom.4` to `1.3.2+custom.5`.
+
+### Fixed
+
+- AMD AMF no longer receives MoviePy's incompatible `medium` preset; the
+  validated `speed` preset and `yuv420p` output are used consistently.
+- Process CPU telemetry reuses a primed process counter instead of recording
+  zero from a newly created sampler on every interval.
+
 ## [1.3.2+custom.4] - 2026-07-15
 
 ### Changed

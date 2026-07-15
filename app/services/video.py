@@ -356,6 +356,20 @@ def _get_temp_audio_dir(output_dir: str) -> str:
     return output_dir
 
 
+def _codec_write_kwargs(codec: str, kwargs: dict) -> dict:
+    """Apply only encoder options validated by the adaptive benchmark."""
+
+    options = dict(kwargs)
+    preset = performance.encoder_preset(codec)
+    if preset:
+        options["preset"] = preset
+    if codec in {"h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox"}:
+        ffmpeg_params = list(options.get("ffmpeg_params") or [])
+        ffmpeg_params.extend(["-pix_fmt", "yuv420p"])
+        options["ffmpeg_params"] = ffmpeg_params
+    return options
+
+
 def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
@@ -364,7 +378,11 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     文件被占用、目录权限、杀软拦截等通用 IO 问题。只有 libx264 能成功写出时，
     才能判断原始失败大概率来自硬件编码器本身，避免误伤后续任务。
     """
-    clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
+    clip.write_videofile(
+        output_file,
+        codec=_DEFAULT_VIDEO_CODEC,
+        **_codec_write_kwargs(_DEFAULT_VIDEO_CODEC, kwargs),
+    )
     _disable_runtime_video_codec(failed_codec, reason)
     return _DEFAULT_VIDEO_CODEC
 
@@ -378,7 +396,11 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
     """
     effective_codec = _get_effective_video_codec(codec)
     try:
-        clip.write_videofile(output_file, codec=effective_codec, **kwargs)
+        clip.write_videofile(
+            output_file,
+            codec=effective_codec,
+            **_codec_write_kwargs(effective_codec, kwargs),
+        )
         return effective_codec
     except Exception as exc:
         if effective_codec == _DEFAULT_VIDEO_CODEC:
@@ -409,6 +431,42 @@ def _format_ffmpeg_concat_path(file_path: str) -> str:
     return _escape_ffmpeg_concat_path(absolute_path.replace("\\", "/"))
 
 
+def _mux_video_with_audio_copy(
+    video_path: str,
+    audio_path: str,
+    output_file: str,
+    voice_volume: float,
+) -> None:
+    """Attach narration without decoding an already normalized video stream."""
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        audio_bitrate,
+    ]
+    if abs(float(voice_volume) - 1.0) > 0.001:
+        command.extend(["-af", f"volume={float(voice_volume):.4f}"])
+    command.extend(["-shortest", output_file])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout or "FFmpeg audio mux failed").strip()
+        )
+
+
 def concat_video_clips_with_ffmpeg(
     clip_files: List[str],
     output_file: str,
@@ -435,6 +493,9 @@ def concat_video_clips_with_ffmpeg(
             codec,
         ]
         if codec != "copy":
+            preset = performance.encoder_preset(codec)
+            if preset:
+                command.extend(["-preset", preset])
             command.extend(
                 [
                     "-threads",
@@ -1076,6 +1137,19 @@ def generate_video(
     logger.info(f"  ② audio: {audio_path}")
     logger.info(f"  ③ subtitle: {subtitle_path}")
     logger.info(f"  ④ output: {output_file}")
+
+    no_bgm_requested = (
+        bgm_file_override in {None, ""}
+        and str(params.bgm_type or "").strip().lower() in {"", "none"}
+    )
+    if not params.subtitle_enabled and no_bgm_requested:
+        _mux_video_with_audio_copy(
+            video_path,
+            audio_path,
+            output_file,
+            params.voice_volume,
+        )
+        return True
 
     # https://github.com/harry0703/MoneyPrinterTurbo/issues/217
     # PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'final-1.mp4.tempTEMP_MPY_wvf_snd.mp3'

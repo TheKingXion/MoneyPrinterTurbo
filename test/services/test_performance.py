@@ -223,7 +223,7 @@ class PerformanceProfileTests(unittest.TestCase):
         self.assertEqual(capabilities.encoders, {"h264_nvenc", "h264_amf", "libx264"})
         self.assertEqual(capabilities.hwaccels, {"cuda", "qsv"})
 
-    def test_probe_is_tiny_safe_and_inside_storage(self):
+    def test_probe_is_representative_safe_and_inside_storage(self):
         ffmpeg = performance.FFmpegCapabilities(
             "ffmpeg", "v", frozenset({"h264_nvenc"}), frozenset()
         )
@@ -233,13 +233,16 @@ class PerformanceProfileTests(unittest.TestCase):
             seen["command"] = command
             seen["timeout"] = timeout
             self.assertTrue(Path(command[-1]).is_relative_to(self.storage))
+            Path(command[-1]).write_bytes(b"encoded")
             return completed()
 
         with patch.object(performance, "_run", side_effect=fake_run):
             self.assertTrue(performance.probe_encoder(ffmpeg, "h264_nvenc", self.storage))
 
-        self.assertIn("color=c=black:s=256x256:r=10:d=0.25", seen["command"])
-        self.assertLessEqual(seen["timeout"], 8)
+        self.assertIn("testsrc2=size=1080x1920:rate=30:duration=1", seen["command"])
+        self.assertIn("sine=frequency=1000:sample_rate=44100:duration=1", seen["command"])
+        self.assertEqual(seen["command"][seen["command"].index("-preset") + 1], "p4")
+        self.assertLessEqual(seen["timeout"], 30)
         self.assertNotIn("shell", seen["command"])
 
     def test_profile_prefers_successful_encoder_and_sets_disk_flags(self):
@@ -282,7 +285,73 @@ class PerformanceProfileTests(unittest.TestCase):
 
         self.assertEqual(profile.h264_codec, "h264_nvenc")
         self.assertEqual(profile.render_slots, 1)
-        self.assertEqual(profile.ffmpeg_threads, 8)
+        self.assertEqual(profile.ffmpeg_threads, 12)
+
+    def test_measured_profile_prefers_vendor_hardware_with_small_cpu_advantage(self):
+        hardware = performance.HardwareInfo(
+            10, 16, 32 * performance.GIB, 20 * performance.GIB,
+            500 * performance.GIB, 100 * performance.GIB, "Windows",
+            (performance.GPUInfo(
+                "RTX 3050 Laptop", 4 * performance.GIB, None, "test", vendor="nvidia"
+            ),),
+        )
+        benchmarks = {
+            "h264_nvenc": performance.EncoderBenchmark(True, 1.0, 30.0),
+            "libx264": performance.EncoderBenchmark(True, 0.9, 33.0),
+        }
+
+        profile = performance.derive_profile(
+            hardware,
+            performance.FFmpegCapabilities("ffmpeg", "v"),
+            {"h264_nvenc": True, "libx264": True},
+            encoder_benchmarks=benchmarks,
+        )
+
+        self.assertEqual(profile.h264_codec, "h264_nvenc")
+        self.assertEqual(profile.render_slots, 1)
+
+    def test_laptop_on_battery_reduces_render_parallelism_and_threads(self):
+        hardware = performance.HardwareInfo(
+            10, 16, 32 * performance.GIB, 24 * performance.GIB,
+            500 * performance.GIB, 100 * performance.GIB, "Windows", (),
+            is_laptop=True, power_plugged=False,
+        )
+
+        profile = performance.derive_profile(
+            hardware,
+            performance.FFmpegCapabilities("ffmpeg", "v"),
+            {"libx264": True},
+        )
+
+        self.assertEqual(profile.render_slots, 1)
+        self.assertLessEqual(profile.ffmpeg_threads, 5)
+
+    def test_task_slots_scale_with_memory_and_power(self):
+        desktop_eight = performance.HardwareInfo(
+            8, 16, 8 * performance.GIB, 4 * performance.GIB,
+            100 * performance.GIB, 50 * performance.GIB, "Windows",
+        )
+        laptop_thirty_two = replace(
+            desktop_eight,
+            ram_total=32 * performance.GIB,
+            ram_available=24 * performance.GIB,
+            is_laptop=True,
+            power_plugged=True,
+        )
+        laptop_battery = replace(laptop_thirty_two, power_plugged=False)
+
+        self.assertEqual(performance.recommended_task_slots(desktop_eight, 5), 2)
+        self.assertEqual(performance.recommended_task_slots(laptop_thirty_two, 5), 5)
+        self.assertEqual(performance.recommended_task_slots(laptop_battery, 5), 2)
+
+    def test_adaptive_render_gate_blocks_second_render_under_memory_pressure(self):
+        gate = performance.AdaptiveRenderGate(2, 2 * performance.GIB, 3 * performance.GIB)
+        with patch.object(
+            performance, "_memory", return_value=(8 * performance.GIB, performance.GIB)
+        ):
+            self.assertTrue(gate.acquire(blocking=False))
+            self.assertFalse(gate.acquire(blocking=False))
+            gate.release()
 
     def test_profile_can_select_amd_amf_and_limit_slots_by_vram(self):
         hardware = performance.HardwareInfo(
@@ -324,7 +393,11 @@ class PerformanceProfileTests(unittest.TestCase):
         ffmpeg = performance.FFmpegCapabilities("missing-ffmpeg", "v1", frozenset({"libx264"}))
         with patch.object(performance, "detect_hardware", return_value=hardware), patch.object(
             performance, "inspect_ffmpeg", return_value=ffmpeg
-        ), patch.object(performance, "probe_encoder", return_value=True) as probe:
+        ), patch.object(
+            performance,
+            "benchmark_encoder",
+            return_value=performance.EncoderBenchmark(True, 1.0, 30.0),
+        ) as probe:
             first = performance.get_performance_profile(self.storage)
             second = performance.get_performance_profile(self.storage)
             changed = replace(ffmpeg, version="v2")
@@ -334,7 +407,7 @@ class PerformanceProfileTests(unittest.TestCase):
         self.assertEqual(first.fingerprint, second.fingerprint)
         self.assertEqual(probe.call_count, 2)
         cache = json.loads((self.storage / "performance_profile.json").read_text())
-        self.assertEqual(cache["version"], 4)
+        self.assertEqual(cache["version"], 5)
 
 class TelemetryTests(unittest.TestCase):
     def setUp(self):

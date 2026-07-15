@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - depends on the runtime environment
 P = ParamSpec("P")
 R = TypeVar("R")
 GIB = 1024**3
-_PROFILE_CACHE_VERSION = 4
+_PROFILE_CACHE_VERSION = 5
 _ENCODER_PREFERENCE = (
     "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "libx264"
 )
@@ -96,6 +96,8 @@ class HardwareInfo:
     cpu_temperature_c: float | None = None
     cpu_temperature_source: str | None = None
     cpu_name: str = ""
+    is_laptop: bool = False
+    power_plugged: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,16 @@ class FFmpegCapabilities:
 
 
 @dataclass(frozen=True)
+class EncoderBenchmark:
+    """Result of a representative vertical-video encoder benchmark."""
+
+    supported: bool
+    elapsed_seconds: float | None = None
+    encoded_fps: float | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class PerformanceProfile:
     """Conservative concurrency and encoder settings for the current host."""
 
@@ -117,9 +129,14 @@ class PerformanceProfile:
     ffmpeg_threads: int
     render_slots: int
     network_slots: int
+    task_slots: int
     disk_low: bool
     disk_critical: bool
     encoder_probes: Mapping[str, bool] = field(default_factory=dict)
+    encoder_benchmarks: Mapping[str, EncoderBenchmark] = field(default_factory=dict)
+    ram_reserve_bytes: int = 0
+    estimated_ram_per_render: int = 0
+    selection_reason: str = ""
 
 
 def _run(command: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
@@ -170,6 +187,21 @@ def _memory() -> tuple[int, int]:
         except (AttributeError, OSError):
             pass
     return 0, 0
+
+
+def _battery_state() -> tuple[bool, bool | None]:
+    """Return whether the host has a battery and whether external power is connected."""
+
+    if _psutil is None:
+        return False, None
+    try:
+        battery = _psutil.sensors_battery()
+    except Exception:
+        return False, None
+    if battery is None:
+        return False, None
+    plugged = getattr(battery, "power_plugged", None)
+    return True, bool(plugged) if plugged is not None else None
 
 
 def _cpu_counts() -> tuple[int, int]:
@@ -750,6 +782,7 @@ def detect_hardware(
         disk = shutil.disk_usage(base.anchor or os.curdir)
     physical, logical = _cpu_counts()
     ram_total, ram_available = _memory()
+    is_laptop, power_plugged = _battery_state()
     system = platform.system()
     gpus, cpu_temperature, temperature_source = _probe_hardware_devices(system, force=force)
     return HardwareInfo(
@@ -764,6 +797,8 @@ def detect_hardware(
         cpu_temperature_c=cpu_temperature,
         cpu_temperature_source=temperature_source,
         cpu_name=_cpu_name(),
+        is_laptop=is_laptop,
+        power_plugged=power_plugged,
     )
 
 
@@ -816,43 +851,95 @@ def hardware_fingerprint(hardware: HardwareInfo, ffmpeg: FFmpegCapabilities) -> 
     return hashlib.sha256(raw).hexdigest()
 
 
+def encoder_preset(codec: str) -> str | None:
+    """Return a fast, broadly supported MoviePy/FFmpeg preset for a codec."""
+
+    return {
+        "h264_amf": "speed",
+        "h264_nvenc": "p4",
+        "h264_qsv": "veryfast",
+        "libx264": "veryfast",
+    }.get(codec)
+
+
+def _encoder_probe_command(
+    ffmpeg: FFmpegCapabilities,
+    codec: str,
+    output: str,
+    *,
+    duration: float = 1.0,
+) -> list[str]:
+    """Build a vertical-video probe matching the application's output path."""
+
+    command = [
+        ffmpeg.binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size=1080x1920:rate=30:duration={duration:g}",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=1000:sample_rate=44100:duration={duration:g}",
+        "-shortest",
+        "-c:v",
+        codec,
+    ]
+    preset = encoder_preset(codec)
+    if preset:
+        command.extend(["-preset", preset])
+    command.extend(["-pix_fmt", "yuv420p", "-c:a", "aac", "-y", output])
+    return command
+
+
+def benchmark_encoder(
+    ffmpeg: FFmpegCapabilities,
+    codec: str,
+    storage_path: str | os.PathLike[str],
+    *,
+    duration: float = 1.0,
+) -> EncoderBenchmark:
+    """Measure a representative 1080x1920 H.264 encode with audio."""
+
+    if codec not in ffmpeg.encoders or codec not in _ENCODER_PREFERENCE:
+        return EncoderBenchmark(False, error="encoder is not advertised by FFmpeg")
+    storage = Path(storage_path).resolve()
+    storage.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    try:
+        with tempfile.TemporaryDirectory(prefix="ffmpeg-probe-", dir=storage) as temp_dir:
+            output = str(Path(temp_dir) / "probe.mp4")
+            result = _run(
+                _encoder_probe_command(
+                    ffmpeg, codec, output, duration=max(0.5, float(duration))
+                ),
+                timeout=30.0,
+            )
+            elapsed = max(0.001, time.perf_counter() - started)
+            valid_output = result.returncode == 0 and Path(output).stat().st_size > 0
+            if not valid_output:
+                error = (result.stderr or result.stdout or "encoder probe failed").strip()
+                return EncoderBenchmark(False, elapsed, None, redact_error(error))
+            return EncoderBenchmark(
+                True,
+                elapsed_seconds=elapsed,
+                encoded_fps=(max(0.5, float(duration)) * 30.0) / elapsed,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return EncoderBenchmark(False, error=redact_error(exc))
+
+
 def probe_encoder(
     ffmpeg: FFmpegCapabilities,
     codec: str,
     storage_path: str | os.PathLike[str],
 ) -> bool:
-    """Encode 0.25 seconds of generated video inside the approved storage path."""
+    """Return whether a representative vertical-video benchmark succeeds."""
 
-    if codec not in ffmpeg.encoders or codec not in _ENCODER_PREFERENCE:
-        return False
-    storage = Path(storage_path).resolve()
-    storage.mkdir(parents=True, exist_ok=True)
-    try:
-        with tempfile.TemporaryDirectory(prefix="ffmpeg-probe-", dir=storage) as temp_dir:
-            output = str(Path(temp_dir) / "probe.mp4")
-            result = _run(
-                [
-                    ffmpeg.binary,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "color=c=black:s=256x256:r=10:d=0.25",
-                    "-frames:v",
-                    "2",
-                    "-an",
-                    "-c:v",
-                    codec,
-                    "-y",
-                    output,
-                ],
-                timeout=8.0,
-            )
-            return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    return benchmark_encoder(ffmpeg, codec, storage_path).supported
 
 
 def derive_profile(
@@ -860,8 +947,9 @@ def derive_profile(
     ffmpeg: FFmpegCapabilities,
     encoder_probes: Mapping[str, bool],
     fingerprint: str | None = None,
+    encoder_benchmarks: Mapping[str, EncoderBenchmark] | None = None,
 ) -> PerformanceProfile:
-    """Derive conservative settings from measured resources and probe results."""
+    """Derive measured encoder, CPU and concurrency settings for this host."""
 
     codec_vendors = {
         "h264_nvenc": "nvidia",
@@ -870,18 +958,50 @@ def derive_profile(
         "h264_videotoolbox": "apple",
     }
     detected_vendors = {gpu.vendor for gpu in hardware.gpus}
-    codec = next((
-        name for name in _ENCODER_PREFERENCE
+    benchmarks = dict(encoder_benchmarks or {})
+    candidates = [
+        name
+        for name in _ENCODER_PREFERENCE
         if encoder_probes.get(name)
         and (
             name not in codec_vendors
             or not detected_vendors
             or codec_vendors[name] in detected_vendors
         )
-    ), "libx264")
+    ]
+    measured = [
+        name
+        for name in candidates
+        if benchmarks.get(name) and benchmarks[name].supported
+        and benchmarks[name].encoded_fps is not None
+    ]
+    native_measured = [
+        name
+        for name in measured
+        if name in codec_vendors and codec_vendors[name] in detected_vendors
+    ]
+    if native_measured:
+        codec = max(
+            native_measured,
+            key=lambda name: float(benchmarks[name].encoded_fps or 0),
+        )
+        selection_reason = "fastest stable native GPU encoder"
+    elif measured:
+        codec = max(
+            measured,
+            key=lambda name: float(benchmarks[name].encoded_fps or 0),
+        )
+        selection_reason = "fastest representative benchmark"
+    else:
+        codec = candidates[0] if candidates else "libx264"
+        selection_reason = "first stable vendor-compatible encoder"
     available_gib = hardware.ram_available / GIB if hardware.ram_available else 2.0
+    total_gib = hardware.ram_total / GIB if hardware.ram_total else available_gib
+    ram_reserve = int(max(1.5, total_gib * 0.15) * GIB)
+    estimated_ram_per_render = int((2.5 if total_gib <= 16 else 3.0) * GIB)
+    usable_memory = max(0, hardware.ram_available - ram_reserve)
     cpu_limit = max(1, hardware.cpu_physical // 2)
-    memory_limit = max(1, int(available_gib // 3))
+    memory_limit = max(1, usable_memory // max(1, estimated_ram_per_render))
     render_slots = min(4, cpu_limit, memory_limit)
     codec_vendor = codec_vendors.get(codec)
     matching_vram = [
@@ -892,31 +1012,137 @@ def derive_profile(
         total_vram = sum(matching_vram)
         gpu_limit = 1 if total_vram <= 6 * GIB else 2 if total_vram <= 12 * GIB else 3
         render_slots = min(render_slots, gpu_limit)
+    if hardware.is_laptop and hardware.power_plugged is False:
+        render_slots = 1
     disk_low_threshold = max(5 * GIB, int(hardware.disk_total * 0.05))
     disk_critical_threshold = max(GIB, int(hardware.disk_total * 0.02))
+    threads_per_render = max(1, hardware.cpu_logical // max(1, render_slots))
+    thread_cap = 16 if codec == "libx264" else 12
+    ffmpeg_threads = max(1, min(thread_cap, hardware.cpu_physical, threads_per_render))
+    if hardware.is_laptop and hardware.power_plugged is False:
+        ffmpeg_threads = max(2, min(ffmpeg_threads, max(2, hardware.cpu_physical // 2)))
     return PerformanceProfile(
         fingerprint=fingerprint or hardware_fingerprint(hardware, ffmpeg),
         h264_codec=codec,
-        ffmpeg_threads=max(1, min(8, hardware.cpu_logical // max(1, render_slots))),
+        ffmpeg_threads=ffmpeg_threads,
         render_slots=max(1, render_slots),
         network_slots=max(2, min(4, hardware.cpu_logical)),
+        task_slots=recommended_task_slots(hardware, 5),
         disk_low=hardware.disk_free < disk_low_threshold,
         disk_critical=hardware.disk_free < disk_critical_threshold,
         encoder_probes=dict(encoder_probes),
+        encoder_benchmarks=benchmarks,
+        ram_reserve_bytes=ram_reserve,
+        estimated_ram_per_render=estimated_ram_per_render,
+        selection_reason=selection_reason,
     )
 
 
-render_slot = threading.BoundedSemaphore(1)
+def recommended_task_slots(hardware: HardwareInfo, configured_limit: int) -> int:
+    """Limit whole pipelines by RAM while allowing network/render overlap."""
+
+    configured = max(1, int(configured_limit or 1))
+    total_gib = hardware.ram_total / GIB if hardware.ram_total else 4.0
+    memory_slots = 1 if total_gib < 6 else 2 if total_gib < 12 else 3 if total_gib < 24 else 5
+    if hardware.is_laptop and hardware.power_plugged is False:
+        memory_slots = min(memory_slots, 2)
+    return max(1, min(configured, memory_slots))
+
+
+class AdaptiveRenderGate:
+    """Semaphore that also prevents new renders during live resource pressure."""
+
+    def __init__(
+        self,
+        capacity: int,
+        ram_reserve_bytes: int,
+        estimated_ram_per_render: int,
+    ) -> None:
+        self.capacity = max(1, int(capacity))
+        self.ram_reserve_bytes = max(512 * 1024**2, int(ram_reserve_bytes))
+        self.estimated_ram_per_render = max(GIB, int(estimated_ram_per_render))
+        self._semaphore = threading.BoundedSemaphore(self.capacity)
+        self._lock = threading.Lock()
+        self._active = 0
+
+    def _resources_allow_start(self) -> bool:
+        _, available = _memory()
+        with self._lock:
+            active = self._active
+        if available and available < 512 * 1024**2:
+            return False
+        if active == 0:
+            return True
+        required = self.ram_reserve_bytes + self.estimated_ram_per_render
+        if available and available < required:
+            return False
+        telemetry = _nvidia_gpus()
+        if os.name == "nt":
+            telemetry += _amd_adl_gpus()
+        temperatures = [
+            gpu.temperature_c for gpu in telemetry if gpu.temperature_c is not None
+        ]
+        return not temperatures or max(temperatures) < 88
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        started = time.monotonic()
+        while True:
+            remaining = None
+            if timeout is not None:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                if remaining <= 0:
+                    return False
+            wait = min(1.0, remaining) if remaining is not None else 1.0
+            acquired = (
+                self._semaphore.acquire(timeout=wait)
+                if blocking
+                else self._semaphore.acquire(blocking=False)
+            )
+            if not acquired:
+                if not blocking:
+                    return False
+                continue
+            if self._resources_allow_start():
+                with self._lock:
+                    self._active += 1
+                return True
+            self._semaphore.release()
+            if not blocking:
+                return False
+            time.sleep(0.25)
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active <= 0:
+                raise ValueError("render gate released too many times")
+            self._active -= 1
+        self._semaphore.release()
+
+    def __enter__(self) -> "AdaptiveRenderGate":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        self.release()
+        return False
+
+
+render_slot = AdaptiveRenderGate(1, int(1.5 * GIB), int(2.5 * GIB))
 network_slot = threading.BoundedSemaphore(2)
 _profile_lock = threading.Lock()
 _runtime_profile: PerformanceProfile | None = None
+_runtime_power_state: tuple[bool, bool | None] | None = None
 
 
 def configure_slots(profile: PerformanceProfile) -> None:
     """Replace the exported semaphores with limits from ``profile``."""
 
     global render_slot, network_slot
-    render_slot = threading.BoundedSemaphore(profile.render_slots)
+    render_slot = AdaptiveRenderGate(
+        profile.render_slots,
+        profile.ram_reserve_bytes,
+        profile.estimated_ram_per_render,
+    )
     network_slot = threading.BoundedSemaphore(profile.network_slots)
 
 
@@ -938,23 +1164,34 @@ def get_performance_profile(
     fingerprint = hardware_fingerprint(hardware, ffmpeg)
     cache_path = storage / "performance_profile.json"
     probes: dict[str, bool] | None = None
+    benchmarks: dict[str, EncoderBenchmark] | None = None
     if not force:
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             if cached.get("version") == _PROFILE_CACHE_VERSION and cached.get("fingerprint") == fingerprint:
                 probes = {str(k): bool(v) for k, v in cached["encoder_probes"].items()}
+                benchmarks = {
+                    str(codec): EncoderBenchmark(**result)
+                    for codec, result in cached["encoder_benchmarks"].items()
+                    if isinstance(result, dict)
+                }
         except (OSError, ValueError, KeyError, TypeError):
             pass
-    if probes is None:
-        probes = {
-            codec: probe_encoder(ffmpeg, codec, storage)
+    if probes is None or benchmarks is None:
+        benchmarks = {
+            codec: benchmark_encoder(ffmpeg, codec, storage)
             for codec in _ENCODER_PREFERENCE
             if codec in ffmpeg.encoders
         }
+        probes = {codec: result.supported for codec, result in benchmarks.items()}
         payload = {
             "version": _PROFILE_CACHE_VERSION,
             "fingerprint": fingerprint,
             "encoder_probes": probes,
+            "encoder_benchmarks": {
+                codec: dataclasses.asdict(result)
+                for codec, result in benchmarks.items()
+            },
         }
         temp_path = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         try:
@@ -965,7 +1202,7 @@ def get_performance_profile(
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-    profile = derive_profile(hardware, ffmpeg, probes, fingerprint)
+    profile = derive_profile(hardware, ffmpeg, probes, fingerprint, benchmarks)
     configure_slots(profile)
     return profile
 
@@ -973,10 +1210,12 @@ def get_performance_profile(
 def get_runtime_profile(force: bool = False) -> PerformanceProfile:
     """Return the process-wide adaptive profile, probing only when necessary."""
 
-    global _runtime_profile
+    global _runtime_profile, _runtime_power_state
     with _profile_lock:
-        if _runtime_profile is None or force:
+        power_state = _battery_state()
+        if _runtime_profile is None or force or power_state != _runtime_power_state:
             _runtime_profile = get_performance_profile(force=force)
+            _runtime_power_state = power_state
         return _runtime_profile
 
 
@@ -1087,6 +1326,14 @@ class PerformanceTelemetry:
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
         self.db_path = Path(db_path or Path(_storage_dir()) / "performance.db").resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._process = None
+        if _psutil is not None:
+            try:
+                self._process = _psutil.Process()
+                self._process.cpu_percent(interval=None)
+                _psutil.cpu_percent(interval=None)
+            except Exception:
+                self._process = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1113,10 +1360,24 @@ class PerformanceTelemetry:
                 CREATE TABLE IF NOT EXISTS resource_samples (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, sampled_at REAL NOT NULL,
                     cpu_percent REAL, rss_bytes INTEGER, ram_available INTEGER,
-                    gpu_percent REAL, gpu_memory_used INTEGER
+                    gpu_percent REAL, gpu_memory_used INTEGER,
+                    system_cpu_percent REAL, cpu_frequency_mhz REAL,
+                    gpu_temperature_c REAL
                 );
                 """
             )
+            existing = {
+                row[1] for row in connection.execute("PRAGMA table_info(resource_samples)")
+            }
+            for name, sql_type in (
+                ("system_cpu_percent", "REAL"),
+                ("cpu_frequency_mhz", "REAL"),
+                ("gpu_temperature_c", "REAL"),
+            ):
+                if name not in existing:
+                    connection.execute(
+                        f"ALTER TABLE resource_samples ADD COLUMN {name} {sql_type}"
+                    )
 
     @staticmethod
     def _context_json(context: Mapping[str, Any]) -> str:
@@ -1178,12 +1439,17 @@ class PerformanceTelemetry:
         """Store one process/memory/GPU sample; unavailable metrics stay NULL."""
 
         cpu = rss = available = gpu_percent = gpu_memory = None
+        system_cpu = cpu_frequency = gpu_temperature = None
         if _psutil is not None:
             try:
-                process = _psutil.Process()
+                process = self._process or _psutil.Process()
                 cpu = float(process.cpu_percent(interval=None))
                 rss = int(process.memory_info().rss)
                 available = int(_psutil.virtual_memory().available)
+                system_cpu = float(_psutil.cpu_percent(interval=None))
+                frequency = _psutil.cpu_freq()
+                if frequency is not None:
+                    cpu_frequency = float(frequency.current)
             except Exception:
                 pass
         vendor_metrics = _nvidia_gpus()
@@ -1200,10 +1466,23 @@ class PerformanceTelemetry:
             gpu_percent = max(percentages)
         if memory_values:
             gpu_memory = sum(memory_values)
+        temperatures = [
+            gpu.temperature_c for gpu in vendor_metrics if gpu.temperature_c is not None
+        ]
+        if temperatures:
+            gpu_temperature = max(temperatures)
         with closing(self._connect()) as connection, connection:
             connection.execute(
-                "INSERT INTO resource_samples (task_id, sampled_at, cpu_percent, rss_bytes, ram_available, gpu_percent, gpu_memory_used) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (task_id or _task_id.get(), time.time(), cpu, rss, available, gpu_percent, gpu_memory),
+                "INSERT INTO resource_samples "
+                "(task_id, sampled_at, cpu_percent, rss_bytes, ram_available, "
+                "gpu_percent, gpu_memory_used, system_cpu_percent, "
+                "cpu_frequency_mhz, gpu_temperature_c) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id or _task_id.get(), time.time(), cpu, rss, available,
+                    gpu_percent, gpu_memory, system_cpu, cpu_frequency,
+                    gpu_temperature,
+                ),
             )
 
     def sampler(self, interval: float = 1.0, max_samples: int = 3600) -> ResourceSampler:
@@ -1244,7 +1523,8 @@ class PerformanceTelemetry:
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT sampled_at, cpu_percent, rss_bytes, ram_available, "
-                "gpu_percent, gpu_memory_used FROM resource_samples "
+                "gpu_percent, gpu_memory_used, system_cpu_percent, "
+                "cpu_frequency_mhz, gpu_temperature_c FROM resource_samples "
                 "ORDER BY sampled_at DESC LIMIT 1"
             ).fetchone()
         return dict(row) if row else {}
@@ -1313,9 +1593,10 @@ def instrument_stage(name: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
 
 
 __all__ = [
-    "FFmpegCapabilities", "GPUInfo", "HardwareInfo", "PerformanceProfile",
-    "PerformanceTelemetry", "ResourceSampler", "configure_slots", "derive_profile",
+    "AdaptiveRenderGate", "EncoderBenchmark", "FFmpegCapabilities", "GPUInfo",
+    "HardwareInfo", "PerformanceProfile", "PerformanceTelemetry", "ResourceSampler",
+    "benchmark_encoder", "configure_slots", "derive_profile", "encoder_preset",
     "detect_hardware", "get_performance_profile", "get_runtime_profile", "get_telemetry",
     "hardware_fingerprint", "inspect_ffmpeg", "instrument_stage", "instrument_task",
-    "network_slot", "probe_encoder", "redact_error", "render_slot",
+    "network_slot", "probe_encoder", "recommended_task_slots", "redact_error", "render_slot",
 ]
