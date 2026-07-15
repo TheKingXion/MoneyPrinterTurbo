@@ -1,4 +1,6 @@
+import numpy as np
 from moviepy import Clip, ColorClip, CompositeVideoClip, vfx
+from PIL import Image
 
 
 # FadeIn
@@ -71,3 +73,52 @@ def slideout_transition(clip: Clip, t: float, side: str) -> Clip:
     return CompositeVideoClip([background, moving_clip], size=(width, height)).with_duration(
         clip.duration
     )
+
+
+_ZOOM_MAX_SCALE = 1.2
+
+
+def _zoom_frame(frame: np.ndarray, scale_factor: float) -> np.ndarray:
+    """Zoom around a stable subpixel center without changing frame geometry."""
+    if scale_factor <= 0:
+        raise ValueError("scale_factor must be greater than zero")
+    if abs(scale_factor - 1.0) < 1e-9:
+        return frame
+
+    height, width = frame.shape[:2]
+    crop_width = width / scale_factor
+    crop_height = height / scale_factor
+    left = (width - crop_width) / 2
+    top = (height - crop_height) / 2
+    image = Image.fromarray(frame)
+    transformed = image.transform(
+        (width, height),
+        Image.Transform.EXTENT,
+        (left, top, left + crop_width, top + crop_height),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return np.asarray(transformed)
+
+
+def zoomin_transition(clip: Clip, t: float) -> Clip:
+    _ = t
+    duration = max(clip.duration, 0.001)
+
+    def scale_effect(get_frame, current_time: float):
+        progress = min(max(current_time / duration, 0), 1)
+        scale_factor = 1 + (_ZOOM_MAX_SCALE - 1) * progress
+        return _zoom_frame(get_frame(current_time), scale_factor)
+
+    return clip.transform(scale_effect)
+
+
+def zoomout_transition(clip: Clip, t: float) -> Clip:
+    _ = t
+    duration = max(clip.duration, 0.001)
+
+    def scale_effect(get_frame, current_time: float):
+        progress = min(max(current_time / duration, 0), 1)
+        scale_factor = _ZOOM_MAX_SCALE - (_ZOOM_MAX_SCALE - 1) * progress
+        return _zoom_frame(get_frame(current_time), scale_factor)
+
+    return clip.transform(scale_effect)

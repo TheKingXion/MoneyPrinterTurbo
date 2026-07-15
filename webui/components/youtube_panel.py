@@ -285,12 +285,25 @@ def _render_batch(tr, base_params: VideoParams) -> None:
     st.markdown(f"### 1. {tr('Prepare batch ideas')}")
     top_columns = st.columns([1, 1])
     total = int(top_columns[0].number_input(tr("Total videos"), 1, 100, 10, key="yt_batch_total"))
-    idea_mode = top_columns[1].radio(
+    idea_mode_labels = {
+        "ai": tr("Generate ideas with AI"),
+        "manual": tr("Paste my own subjects"),
+    }
+    idea_mode_key = "yt_batch_idea_mode"
+    # Streamlit serializes a formatted radio value. Keeping business IDs as the
+    # options can leave an ID ("ai") next to translated option labels after any
+    # unrelated rerun, which breaks both AppTest and locale changes. Store the
+    # visible option and map it back to the stable business ID instead.
+    if st.session_state.get(idea_mode_key) not in idea_mode_labels.values():
+        st.session_state[idea_mode_key] = idea_mode_labels["ai"]
+    selected_idea_mode = top_columns[1].radio(
         tr("Idea preparation mode"),
-        ["ai", "manual"],
-        format_func=lambda value: tr("Generate ideas with AI") if value == "ai" else tr("Paste my own subjects"),
+        list(idea_mode_labels.values()),
         horizontal=True,
-        key="yt_batch_idea_mode",
+        key=idea_mode_key,
+    )
+    idea_mode = next(
+        mode for mode, label in idea_mode_labels.items() if label == selected_idea_mode
     )
     draft_context = (idea_mode, total)
     if st.session_state.get("yt_batch_draft_context") not in {None, draft_context}:
@@ -440,12 +453,23 @@ def _render_batch(tr, base_params: VideoParams) -> None:
     )
     schedule_interval_minutes = selected_interval_minutes if interval_enabled else 0
     allow_shared_publish_time = not interval_enabled
-    execution_mode = st.radio(
+    execution_mode_labels = {
+        "interleaved": tr("Generate and schedule one by one"),
+        "generate_all_first": tr("Generate all before scheduling"),
+    }
+    execution_mode_key = "yt_batch_execution_mode"
+    if st.session_state.get(execution_mode_key) not in execution_mode_labels.values():
+        st.session_state[execution_mode_key] = execution_mode_labels["interleaved"]
+    selected_execution_mode = st.radio(
         tr("Execution mode"),
-        ["interleaved", "generate_all_first"],
-        format_func=lambda value: tr("Generate and schedule one by one") if value == "interleaved" else tr("Generate all before scheduling"),
+        list(execution_mode_labels.values()),
         horizontal=True,
-        key="yt_batch_execution_mode",
+        key=execution_mode_key,
+    )
+    execution_mode = next(
+        mode
+        for mode, label in execution_mode_labels.items()
+        if label == selected_execution_mode
     )
     st.caption(f"{tr('Scheduled days')}: {days} · {tr('Videos per day')}: {per_day}")
     try:

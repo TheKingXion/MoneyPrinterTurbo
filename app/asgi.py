@@ -1,6 +1,7 @@
 """Application implementation - ASGI."""
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,7 +16,32 @@ from app.router import root_api_router
 from app.services.tiktok_scheduler import tiktok_scheduler
 from app.services.youtube_batch_runner import youtube_batch_runner
 from app.services import performance
+from app.services import task as task_service
 from app.utils import utils
+
+
+@asynccontextmanager
+async def application_lifespan(_: FastAPI):
+    """Start recovery/schedulers and close their resources with the API process."""
+    task_service.recover_interrupted_cross_posts()
+    try:
+        profile = performance.get_runtime_profile()
+        logger.info(
+            "adaptive performance profile: "
+            f"codec={profile.h264_codec}, threads={profile.ffmpeg_threads}, "
+            f"render_slots={profile.render_slots}, network_slots={profile.network_slots}"
+        )
+    except Exception as exc:
+        logger.warning(f"performance hardware detection failed: {exc}")
+    tiktok_scheduler.start()
+    youtube_batch_runner.resume_pending()
+    logger.info("startup event")
+    try:
+        yield
+    finally:
+        youtube_batch_runner.shutdown()
+        tiktok_scheduler.stop()
+        logger.info("shutdown event")
 
 
 def exception_handler(request: Request, e: HttpException):
@@ -46,6 +72,7 @@ def get_application() -> FastAPI:
         description=config.project_description,
         version=config.project_version,
         debug=False,
+        lifespan=application_lifespan,
     )
     instance.include_router(root_api_router)
     instance.add_exception_handler(HttpException, exception_handler)
@@ -74,26 +101,3 @@ app.mount(
 
 public_dir = utils.public_dir()
 app.mount("/", StaticFiles(directory=public_dir, html=True), name="")
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    youtube_batch_runner.shutdown()
-    tiktok_scheduler.stop()
-    logger.info("shutdown event")
-
-
-@app.on_event("startup")
-def startup_event():
-    try:
-        profile = performance.get_runtime_profile()
-        logger.info(
-            "adaptive performance profile: "
-            f"codec={profile.h264_codec}, threads={profile.ffmpeg_threads}, "
-            f"render_slots={profile.render_slots}, network_slots={profile.network_slots}"
-        )
-    except Exception as exc:
-        logger.warning(f"performance hardware detection failed: {exc}")
-    tiktok_scheduler.start()
-    youtube_batch_runner.resume_pending()
-    logger.info("startup event")

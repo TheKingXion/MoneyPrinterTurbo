@@ -766,12 +766,18 @@ def combine_videos(
                 clip = video_effects.slidein_transition(clip, 1, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
                 clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+            elif transition_value == VideoTransitionMode.zoom_in.value:
+                clip = video_effects.zoomin_transition(clip, 1)
+            elif transition_value == VideoTransitionMode.zoom_out.value:
+                clip = video_effects.zoomout_transition(clip, 1)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
                     lambda c: video_effects.fadein_transition(c, 1),
                     lambda c: video_effects.fadeout_transition(c, 1),
                     lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
                     lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.zoomin_transition(c, 1),
+                    lambda c: video_effects.zoomout_transition(c, 1),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
@@ -1060,7 +1066,8 @@ def generate_video(
     subtitle_path: str,
     output_file: str,
     params: VideoParams,
-):
+    bgm_file_override: str | None = None,
+) -> bool:
     aspect = VideoAspect(params.video_aspect)
     video_width, video_height = aspect.to_resolution()
 
@@ -1263,7 +1270,12 @@ def generate_video(
             text_clips.append(clip)
         video_clip = CompositeVideoClip([video_clip, *text_clips])
 
-    bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+    bgm_file = (
+        bgm_file_override
+        if bgm_file_override is not None
+        else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+    )
+    bgm_mix_succeeded = True
     if bgm_file:
         try:
             bgm_clip = AudioFileClip(bgm_file).with_effects(
@@ -1276,6 +1288,7 @@ def generate_video(
             audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
         except Exception as e:
             logger.error(f"failed to add bgm: {str(e)}")
+            bgm_mix_succeeded = False
 
     video_clip = video_clip.with_audio(audio_clip)
     # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
@@ -1295,6 +1308,7 @@ def generate_video(
     )
     video_clip.close()
     del video_clip
+    return bgm_mix_succeeded
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):

@@ -10,7 +10,8 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import llm, material, performance, subtitle, twelvelabs, video, voice, upload_post
+from app.services import bgm as bgm_service
+from app.services import llm, material, performance, sonilo, subtitle, twelvelabs, video, voice, upload_post
 from app.services import state as sm
 from app.services.youtube_uploader import upload_tracker, youtube_uploader
 from app.services.tiktok_scheduler import tiktok_scheduler
@@ -364,6 +365,11 @@ def _generate_final_videos(
 ):
     final_video_paths = []
     combined_video_paths = []
+    warnings = []
+    sonilo_bgm_requested = (
+        params.bgm_type == "sonilo"
+        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    )
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.match_materials_to_script:
@@ -398,14 +404,37 @@ def _generate_final_videos(
 
         final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
 
+        bgm_file_override = "" if params.bgm_type == "sonilo" else None
+        if sonilo_bgm_requested:
+            sonilo_bgm_path = path.join(
+                utils.task_dir(task_id), f"sonilo-bgm-{index}.m4a"
+            )
+            try:
+                sonilo.generate_bgm(
+                    video_path=combined_video_path,
+                    output_path=sonilo_bgm_path,
+                    video_duration=voice.get_audio_duration(audio_file),
+                    prompt=params.sonilo_bgm_prompt,
+                )
+                bgm_file_override = sonilo_bgm_path
+            except sonilo.SoniloError as exc:
+                logger.warning(
+                    f"Sonilo BGM generation failed: task_id={task_id}, "
+                    f"video_index={index}, error={exc}"
+                )
+                warnings.append({"code": "sonilo_bgm_failed", "video_index": index})
+
         logger.info(f"\n\n## generating video: {index} => {final_video_path}")
-        video.generate_video(
+        bgm_mix_succeeded = video.generate_video(
             video_path=combined_video_path,
             audio_path=audio_file,
             subtitle_path=subtitle_path,
             output_file=final_video_path,
             params=params,
+            bgm_file_override=bgm_file_override,
         )
+        if params.bgm_type == "sonilo" and bgm_file_override and not bgm_mix_succeeded:
+            warnings.append({"code": "sonilo_bgm_failed", "video_index": index})
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
@@ -413,7 +442,7 @@ def _generate_final_videos(
         final_video_paths.append(final_video_path)
         combined_video_paths.append(combined_video_path)
 
-    return final_video_paths, combined_video_paths
+    return final_video_paths, combined_video_paths, warnings
 
 
 @performance.instrument_stage("video_render")
@@ -441,6 +470,16 @@ def start(
         raise RuntimeError("Insufficient free disk space for safe video generation")
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+
+    if (
+        stop_at == "video"
+        and params.bgm_type == "sonilo"
+        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+        and not sonilo.is_enabled()
+    ):
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error("Sonilo background music requires an API key")
+        return
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
@@ -535,7 +574,7 @@ def start(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths = generate_final_videos(
+    final_video_paths, combined_video_paths, warnings = generate_final_videos(
         task_id, params, downloaded_videos, audio_file, subtitle_path
     )
 
@@ -706,11 +745,52 @@ def start(
         "youtube_upload_results": youtube_upload_results if youtube_upload_results else None,
         "tiktok_upload_results": tiktok_upload_results if tiktok_upload_results else None,
         "cross_post_results": cross_post_results if cross_post_results else None,
+        "warnings": warnings or None,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
     return kwargs
+
+
+def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
+    """Mark legacy asynchronous cross-post jobs as failed after a restart.
+
+    The current custom pipeline publishes synchronously, but installations upgraded
+    from the previous release may still contain pending/processing records that no
+    process can resume. Leaving them active also prevents safe task deletion.
+    """
+    recovered = 0
+    page = 1
+    while True:
+        try:
+            tasks, total = sm.state.get_all_tasks(page, page_size)
+        except Exception as exc:
+            logger.exception(f"failed to recover interrupted cross-post tasks: {exc}")
+            return None
+
+        for task in tasks:
+            task_id = str(task.get("task_id") or "")
+            if not task_id or task.get("cross_post_state") not in {
+                const.CROSS_POST_STATE_PENDING,
+                const.CROSS_POST_STATE_PROCESSING,
+            }:
+                continue
+            sm.state.update_task(
+                task_id,
+                cross_post_state=const.CROSS_POST_STATE_FAILED,
+                cross_post_error="Cross-posting was interrupted by a service restart",
+                cross_post_owner=None,
+            )
+            recovered += 1
+
+        if not tasks or page * page_size >= total:
+            break
+        page += 1
+
+    if recovered:
+        logger.warning(f"recovered interrupted cross-post tasks: {recovered}")
+    return recovered
 
 
 if __name__ == "__main__":

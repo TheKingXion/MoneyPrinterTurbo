@@ -1,5 +1,6 @@
 import json
 import locale
+import math
 import os
 import re
 import shutil
@@ -63,6 +64,23 @@ def get_uuid(remove_hyphen: bool = False):
     if remove_hyphen:
         u = u.replace("-", "")
     return u
+
+
+_CLIP_SPEED_MIN = 0.5
+_CLIP_SPEED_MAX = 2.0
+
+
+def normalize_clip_speed(value, default: float = 1.0) -> float:
+    """Normalize a requested playback speed to the supported safe range."""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if not math.isfinite(speed) or speed <= 0:
+        return default
+
+    return min(max(speed, _CLIP_SPEED_MIN), _CLIP_SPEED_MAX)
 
 
 def root_dir():

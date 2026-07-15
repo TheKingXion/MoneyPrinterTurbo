@@ -1,5 +1,7 @@
+import hashlib
 import html
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -36,7 +38,9 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import bgm as bgm_service
 from app.services import cache_manager, llm, video, voice
+from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
@@ -2224,6 +2228,8 @@ def _render_video_settings(panel, params):
                 (tr("FadeOut"), VideoTransitionMode.fade_out.value),
                 (tr("SlideIn"), VideoTransitionMode.slide_in.value),
                 (tr("SlideOut"), VideoTransitionMode.slide_out.value),
+                (tr("ZoomIn"), VideoTransitionMode.zoom_in.value),
+                (tr("ZoomOut"), VideoTransitionMode.zoom_out.value),
             ]
             selected_transition_mode = stable_selectbox(
                 tr("Video Transition Mode"),
@@ -2395,12 +2401,14 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
 
 
 def _render_background_music_settings(params):
-    """渲染背景音乐来源与音量设置。"""
+    """Render background-music settings and return a pending upload."""
+    uploaded_bgm_file = None
     st.divider()
     bgm_options = [
         (tr("No Background Music"), ""),
         (tr("Random Background Music"), "random"),
         (tr("Custom Background Music"), "custom"),
+        (tr("Sonilo Background Music"), "sonilo"),
     ]
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
@@ -2410,15 +2418,6 @@ def _render_background_music_settings(params):
         format_func=lambda value: dict((v, label) for label, v in bgm_options)[value],
     )
     params.bgm_type = selected_bgm_type
-
-    if params.bgm_type == "custom":
-        custom_bgm_file = st.text_input(
-            tr("Custom Background Music File"),
-            key="custom_bgm_file_input",
-        )
-        if custom_bgm_file:
-            # 文件名由服务层映射到 resource/songs 后校验，UI 不接受任意路径。
-            params.bgm_file = custom_bgm_file.strip()
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
         options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
@@ -2427,6 +2426,108 @@ def _render_background_music_settings(params):
         format_func=lambda value: f"{int(value * 100)}%",
         disabled=not params.bgm_type,
     )
+    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+
+    if params.bgm_type == "custom":
+        uploaded_bgm_file = st.file_uploader(
+            tr("Upload Background Music"),
+            type=[ext.removeprefix(".") for ext in bgm_service.SUPPORTED_BGM_EXTENSIONS],
+            accept_multiple_files=False,
+            key="custom_bgm_uploader",
+            help=tr("Upload Background Music Help"),
+            max_upload_size=bgm_service.MAX_BGM_UPLOAD_BYTES // (1024 * 1024),
+        )
+        if uploaded_bgm_file is not None and bgm_enabled:
+            safe_name = ""
+            try:
+                safe_name = bgm_service.sanitize_upload_filename(uploaded_bgm_file.name)
+                validation_key = (
+                    safe_name,
+                    uploaded_bgm_file.size,
+                    hashlib.sha256(uploaded_bgm_file.getbuffer()).hexdigest(),
+                )
+                cached = st.session_state.get("custom_bgm_validation")
+                if not cached or cached.get("key") != validation_key:
+                    try:
+                        bgm_service.validate_bgm_upload(
+                            uploaded_bgm_file.name, uploaded_bgm_file
+                        )
+                    except bgm_service.BgmUploadError as exc:
+                        cached = {"key": validation_key, "error": str(exc), "type": "upload"}
+                        logger.warning(
+                            f"WebUI background music validation rejected: name={safe_name}, error={str(exc)}"
+                        )
+                    except bgm_service.BgmServiceError as exc:
+                        cached = {"key": validation_key, "error": str(exc), "type": "service"}
+                        logger.error(
+                            f"WebUI background music validation failed: name={safe_name}, error={str(exc)}"
+                        )
+                    else:
+                        cached = {"key": validation_key, "error": "", "type": ""}
+                    st.session_state["custom_bgm_validation"] = cached
+                if cached.get("error"):
+                    if cached.get("type") == "service":
+                        raise bgm_service.BgmServiceError(cached["error"])
+                    raise bgm_service.BgmUploadError(cached["error"])
+            except bgm_service.BgmUploadError:
+                params.bgm_file = ""
+                st.error(tr("Invalid Background Music"))
+            except bgm_service.BgmServiceError:
+                params.bgm_file = ""
+                st.error(tr("Background Music Validation Failed"))
+            else:
+                mime = str(getattr(uploaded_bgm_file, "type", "") or "")
+                if not mime.startswith("audio/"):
+                    mime = mimetypes.guess_type(safe_name)[0] or "audio/mpeg"
+                st.audio(uploaded_bgm_file, format=mime)
+                st.info(f"{tr('Background Music Ready')}: {safe_name}")
+                params.bgm_file = safe_name
+
+        custom_bgm_file = st.text_input(
+            tr("Custom Background Music File"),
+            key="custom_bgm_file_input",
+            disabled=uploaded_bgm_file is not None,
+        )
+        if uploaded_bgm_file is None and custom_bgm_file and bgm_enabled:
+            params.bgm_file = custom_bgm_file.strip()
+        elif not bgm_enabled:
+            params.bgm_file = ""
+
+    if params.bgm_type == "sonilo":
+        configured_key = str(config.app.get("sonilo_api_key", "") or "").strip()
+        effective_key = configured_key or os.getenv("SONILO_API_KEY", "").strip()
+        entered_key = st.text_input(
+            tr("Sonilo API Key"),
+            value=effective_key,
+            type="password",
+            key="sonilo_api_key_input",
+            help=tr("Sonilo API Key Help"),
+        ).strip()
+        if configured_key or entered_key != effective_key:
+            config.app["sonilo_api_key"] = entered_key
+        params.sonilo_bgm_prompt = st.text_input(
+            tr("Sonilo Music Prompt"),
+            key="sonilo_bgm_prompt_input",
+            max_chars=sonilo_service.MAX_PROMPT_LENGTH,
+            help=tr("Sonilo Music Prompt Help"),
+        ).strip()
+        if params.video_count > 1:
+            st.warning(tr("Sonilo Multiple Videos Warning"))
+        if st.button(
+            tr("Test Sonilo Connection"),
+            key="test_sonilo_connection_button",
+            use_container_width=True,
+        ):
+            try:
+                sonilo_service.test_connection()
+            except Exception as exc:
+                st.error(tr("Sonilo Connection Test Failed").format(error=str(exc)))
+            else:
+                st.success(tr("Sonilo Connection Test Succeeded"))
+        if bgm_enabled and not sonilo_service.is_enabled():
+            st.warning(tr("Sonilo API Key Required"))
+
+    return uploaded_bgm_file
 
 
 def _render_audio_settings(panel, params):
@@ -2837,8 +2938,8 @@ def _render_audio_settings(panel, params):
                             "Custom audio will be used directly. TTS synthesis will be skipped for this task."
                         )
                     )
-            _render_background_music_settings(params)
-    return uploaded_audio_file, voice_mode
+            uploaded_bgm_file = _render_background_music_settings(params)
+    return uploaded_audio_file, uploaded_bgm_file, voice_mode
 
 
 def _render_subtitle_settings(panel, params):
@@ -3070,7 +3171,7 @@ def _render_subtitle_settings(panel, params):
 
 
 def _render_generation_controls(
-    params, uploaded_files, uploaded_audio_file, voice_mode
+    params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
 ):
     """校验生成依赖、执行任务，并渲染日志与成片结果。"""
     restore_upload_requirements = st.session_state.get(
@@ -3186,6 +3287,24 @@ def _render_generation_controls(
             with open(custom_audio_path, "wb") as f:
                 f.write(uploaded_audio_file.getbuffer())
             params.custom_audio_file = custom_audio_path
+
+        if uploaded_bgm_file and bgm_service.should_use_bgm(
+            params.bgm_type, params.bgm_volume
+        ):
+            try:
+                params.bgm_file = bgm_service.save_bgm_upload(
+                    uploaded_bgm_file.name, uploaded_bgm_file
+                )
+            except bgm_service.BgmUploadError:
+                _remove_active_generation_task(task_id)
+                st.error(tr("Invalid Background Music"))
+                st.stop()
+            except bgm_service.BgmServiceError:
+                _remove_active_generation_task(task_id)
+                st.error(tr("Background Music Validation Failed"))
+                st.stop()
+        elif uploaded_bgm_file:
+            params.bgm_file = ""
 
         if uploaded_files:
             local_videos_dir = utils.storage_dir("local_videos", create=True)
@@ -3307,11 +3426,15 @@ def _render_application():
     _render_script_settings(left_panel, params)
 
     uploaded_files = _render_video_settings(middle_panel, params)
-    uploaded_audio_file, voice_mode = _render_audio_settings(audio_panel, params)
+    uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
+        audio_panel, params
+    )
 
     _render_subtitle_settings(right_panel, params)
 
-    _render_generation_controls(params, uploaded_files, uploaded_audio_file, voice_mode)
+    _render_generation_controls(
+        params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
+    )
 
     from webui.components import performance_panel
 
