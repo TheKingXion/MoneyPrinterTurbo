@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - depends on the runtime environment
 P = ParamSpec("P")
 R = TypeVar("R")
 GIB = 1024**3
-_PROFILE_CACHE_VERSION = 3
+_PROFILE_CACHE_VERSION = 4
 _ENCODER_PREFERENCE = (
     "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "libx264"
 )
@@ -95,6 +95,7 @@ class HardwareInfo:
     gpus: tuple[GPUInfo, ...] = ()
     cpu_temperature_c: float | None = None
     cpu_temperature_source: str | None = None
+    cpu_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,35 @@ def _cpu_counts() -> tuple[int, int]:
     return max(1, int(physical or logical)), logical
 
 
+def _cpu_name() -> str:
+    """Return the processor model without requiring WMI privileges."""
+
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                if str(value).strip():
+                    return " ".join(str(value).split())
+        except (ImportError, OSError):
+            pass
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+                for line in cpuinfo:
+                    if line.casefold().startswith(("model name", "hardware")):
+                        value = line.partition(":")[2].strip()
+                        if value:
+                            return " ".join(value.split())
+        except OSError:
+            pass
+    return " ".join((platform.processor() or platform.machine() or "Unknown CPU").split())
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -298,7 +328,78 @@ def _nvidia_gpus() -> tuple[GPUInfo, ...]:
     return tuple(gpus)
 
 
-def _windows_gpus() -> tuple[GPUInfo, ...]:
+def _windows_registry_gpus() -> tuple[GPUInfo, ...]:
+    """Read display inventory and 64-bit VRAM values directly from the registry."""
+
+    if os.name != "nt":
+        return ()
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - Windows standard library only
+        return ()
+
+    class_path = (
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        "{4d36e968-e325-11ce-bfc1-08002be10318}"
+    )
+    adapters: list[GPUInfo] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, class_path)
+    except OSError:
+        return ()
+    with root:
+        subkey_count = winreg.QueryInfoKey(root)[0]
+        for index in range(subkey_count):
+            try:
+                subkey_name = winreg.EnumKey(root, index)
+                subkey = winreg.OpenKey(root, subkey_name)
+            except OSError:
+                continue
+            with subkey:
+                def value(name: str, default: Any = "") -> Any:
+                    try:
+                        return winreg.QueryValueEx(subkey, name)[0]
+                    except OSError:
+                        return default
+
+                name = str(value("DriverDesc") or "").strip()
+                if not name:
+                    continue
+                device_id = str(value("MatchingDeviceId") or "").strip()
+                driver = str(value("DriverVersion") or "").strip()
+                provider = str(value("ProviderName") or "").strip()
+                vendor = _gpu_vendor(device_id, name, provider)
+                total = value("HardwareInformation.qwMemorySize", None)
+                if total is None:
+                    total = value("HardwareInformation.MemorySize", None)
+                try:
+                    vram = int(total) if total is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    vram = None
+                if vram is not None and vram <= 0:
+                    vram = None
+                if vendor == "intel":
+                    vram = None
+                identity = (device_id.casefold(), name.casefold())
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                adapters.append(
+                    GPUInfo(
+                        name=name,
+                        vram_total=vram,
+                        vram_free=None,
+                        driver_version=driver,
+                        vendor=vendor,
+                        device_id=device_id or name,
+                        metrics_source="Windows registry",
+                    )
+                )
+    return tuple(adapters)
+
+
+def _windows_wmi_gpus() -> tuple[GPUInfo, ...]:
     script = (
         "$g=@(Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,"
         "DriverVersion,AdapterRAM,VideoProcessor); ConvertTo-Json -InputObject $g -Compress"
@@ -334,6 +435,135 @@ def _windows_gpus() -> tuple[GPUInfo, ...]:
             device_id=str(item.get("PNPDeviceID") or item.get("Name")),
         ))
     return tuple(gpus)
+
+
+def _windows_gpus() -> tuple[GPUInfo, ...]:
+    """Combine privilege-free registry inventory with optional WMI details."""
+
+    registry = _windows_registry_gpus()
+    # The display class already contains model, driver, device id, and 64-bit
+    # dedicated VRAM. Avoid a slow/permission-sensitive WMI process when those
+    # authoritative values are available.
+    return registry or _windows_wmi_gpus()
+
+
+def _amd_adl_gpus() -> tuple[GPUInfo, ...]:
+    """Read AMD temperature, load and VRAM usage through the installed ADL driver."""
+
+    if os.name != "nt":
+        return ()
+    try:
+        import ctypes
+        from ctypes import POINTER, byref, c_int, c_void_p
+
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        library = ctypes.WinDLL(str(Path(system_root) / "System32" / "atiadlxx.dll"))
+    except (AttributeError, ImportError, OSError):
+        return ()
+
+    class ADLPMActivity(ctypes.Structure):
+        _fields_ = [(name, c_int) for name in (
+            "iSize", "iEngineClock", "iMemoryClock", "iVddc",
+            "iActivityPercent", "iCurrentPerformanceLevel", "iCurrentBusSpeed",
+            "iCurrentBusLanes", "iMaximumBusLanes", "iReserved",
+        )]
+
+    allocations: list[Any] = []
+
+    @ctypes.CFUNCTYPE(c_void_p, c_int)
+    def allocate(size: int) -> int:
+        buffer = ctypes.create_string_buffer(size)
+        allocations.append(buffer)
+        return ctypes.addressof(buffer)
+
+    context = c_void_p()
+    destroy = None
+    try:
+        create = library.ADL2_Main_Control_Create
+        create.argtypes = [type(allocate), c_int, POINTER(c_void_p)]
+        create.restype = c_int
+        if create(allocate, 1, byref(context)) != 0 or not context:
+            return ()
+        destroy = library.ADL2_Main_Control_Destroy
+        destroy.argtypes = [c_void_p]
+
+        count = c_int()
+        number = library.ADL2_Adapter_NumberOfAdapters_Get
+        number.argtypes = [c_void_p, POINTER(c_int)]
+        if number(context, byref(count)) != 0:
+            return ()
+
+        adapter_id_get = library.ADL2_Adapter_ID_Get
+        adapter_id_get.argtypes = [c_void_p, c_int, POINTER(c_int)]
+        temperature_get = getattr(library, "ADL2_OverdriveN_Temperature_Get", None)
+        if temperature_get is not None:
+            temperature_get.argtypes = [c_void_p, c_int, c_int, POINTER(c_int)]
+        activity_get = getattr(library, "ADL2_Overdrive5_CurrentActivity_Get", None)
+        if activity_get is not None:
+            activity_get.argtypes = [c_void_p, c_int, POINTER(ADLPMActivity)]
+        memory_get = getattr(library, "ADL2_Adapter_DedicatedVRAMUsage_Get", None)
+        if memory_get is not None:
+            memory_get.argtypes = [c_void_p, c_int, POINTER(c_int)]
+
+        adapters = []
+        seen: set[int] = set()
+        for index in range(max(0, count.value)):
+            raw_id = c_int()
+            if adapter_id_get(context, index, byref(raw_id)) != 0:
+                continue
+            adapter_id = raw_id.value & 0xFFFFFFFF
+            if not adapter_id or adapter_id in seen:
+                continue
+            seen.add(adapter_id)
+
+            temperature = None
+            if temperature_get is not None:
+                raw_temperature = c_int()
+                for temperature_type in (1, 0, 2):
+                    if temperature_get(
+                        context, index, temperature_type, byref(raw_temperature)
+                    ) == 0:
+                        temperature = _valid_temperature(raw_temperature.value / 1000)
+                        if temperature is not None:
+                            break
+
+            utilization = None
+            if activity_get is not None:
+                activity = ADLPMActivity()
+                activity.iSize = ctypes.sizeof(ADLPMActivity)
+                if activity_get(context, index, byref(activity)) == 0:
+                    if 0 <= activity.iActivityPercent <= 100:
+                        utilization = float(activity.iActivityPercent)
+
+            used = None
+            if memory_get is not None:
+                used_mb = c_int()
+                if memory_get(context, index, byref(used_mb)) == 0 and used_mb.value >= 0:
+                    used = used_mb.value * 1024**2
+
+            adapters.append(
+                GPUInfo(
+                    name=f"AMD adapter {adapter_id:08X}",
+                    vram_total=None,
+                    vram_free=None,
+                    driver_version="",
+                    temperature_c=temperature,
+                    vendor="amd",
+                    device_id=f"ADL-{adapter_id:08X}",
+                    utilization_percent=utilization,
+                    vram_used=used,
+                    metrics_source="AMD ADL",
+                )
+            )
+        return tuple(adapters)
+    except Exception:
+        return ()
+    finally:
+        if destroy is not None and context:
+            try:
+                destroy(context)
+            except Exception:
+                pass
 
 
 def _linux_gpus() -> tuple[GPUInfo, ...]:
@@ -381,7 +611,7 @@ def _merge_gpus(inventory: tuple[GPUInfo, ...], telemetry: tuple[GPUInfo, ...]) 
         return telemetry
     remaining = list(telemetry)
     merged = []
-    for gpu in inventory:
+    for inventory_index, gpu in enumerate(inventory):
         gpu_bus = gpu.pci_bus_id.casefold().lstrip("0:")
         match = next((
             candidate for candidate in remaining
@@ -390,18 +620,31 @@ def _merge_gpus(inventory: tuple[GPUInfo, ...], telemetry: tuple[GPUInfo, ...]) 
             ) or candidate.name.casefold() == gpu.name.casefold()
         ), None)
         if match is None:
+            same_vendor = [candidate for candidate in remaining if candidate.vendor == gpu.vendor]
+            unmatched_inventory = [
+                candidate for candidate in inventory[inventory_index:]
+                if candidate.vendor == gpu.vendor
+            ]
+            if same_vendor and len(same_vendor) == len(unmatched_inventory):
+                match = same_vendor[0]
+        if match is None:
             merged.append(gpu)
             continue
         remaining.remove(match)
+        total = match.vram_total or gpu.vram_total
+        used = match.vram_used
+        free = match.vram_free
+        if free is None and total is not None and used is not None:
+            free = max(0, total - used)
         merged.append(dataclasses.replace(
             gpu,
-            vram_total=match.vram_total or gpu.vram_total,
-            vram_free=match.vram_free,
+            vram_total=total,
+            vram_free=free,
             driver_version=match.driver_version or gpu.driver_version,
             temperature_c=match.temperature_c,
             utilization_percent=match.utilization_percent,
-            vram_used=match.vram_used,
-            metrics_source=match.metrics_source,
+            vram_used=used,
+            metrics_source=match.metrics_source or gpu.metrics_source,
             pci_bus_id=match.pci_bus_id or gpu.pci_bus_id,
         ))
     return tuple(merged + remaining)
@@ -421,7 +664,10 @@ def _probe_hardware_devices(system: str, *, force: bool = False) -> tuple[tuple[
             _linux_gpus() if system == "Linux" else
             _macos_gpus() if system == "Darwin" else ()
         )
-        gpus = _merge_gpus(inventory, _nvidia_gpus())
+        telemetry = _nvidia_gpus()
+        if system == "Windows":
+            telemetry += _amd_adl_gpus()
+        gpus = _merge_gpus(inventory, telemetry)
         cpu_temperature, temperature_source = _cpu_temperature()
         _hardware_probe_cache[system] = (
             time.monotonic(), gpus, cpu_temperature, temperature_source
@@ -452,6 +698,17 @@ def _cpu_temperature() -> tuple[float | None, str | None]:
             pass
     if platform.system() != "Windows":
         return None, None
+    if _psutil is not None:
+        try:
+            monitor_names = {"librehardwaremonitor.exe", "openhardwaremonitor.exe"}
+            running = any(
+                str(process.info.get("name") or "").casefold() in monitor_names
+                for process in _psutil.process_iter(["name"])
+            )
+            if not running:
+                return None, None
+        except (AttributeError, OSError, RuntimeError, TypeError):
+            pass
     script = (
         "$n=@('root/LibreHardwareMonitor','root/OpenHardwareMonitor');$r=@();"
         "foreach($x in $n){try{$r+=@(Get-CimInstance -Namespace $x -ClassName Sensor -ErrorAction Stop|"
@@ -506,6 +763,7 @@ def detect_hardware(
         gpus=gpus,
         cpu_temperature_c=cpu_temperature,
         cpu_temperature_source=temperature_source,
+        cpu_name=_cpu_name(),
     )
 
 
@@ -544,7 +802,7 @@ def hardware_fingerprint(hardware: HardwareInfo, ffmpeg: FFmpegCapabilities) -> 
     except OSError:
         pass
     stable = {
-        "cpu": [hardware.cpu_physical, hardware.cpu_logical],
+        "cpu": [hardware.cpu_name, hardware.cpu_physical, hardware.cpu_logical],
         "ram_total": hardware.ram_total,
         "platform": hardware.platform,
         "gpus": [
@@ -605,16 +863,27 @@ def derive_profile(
 ) -> PerformanceProfile:
     """Derive conservative settings from measured resources and probe results."""
 
-    codec = next(
-        (name for name in _ENCODER_PREFERENCE if encoder_probes.get(name)),
-        "libx264",
-    )
+    codec_vendors = {
+        "h264_nvenc": "nvidia",
+        "h264_amf": "amd",
+        "h264_qsv": "intel",
+        "h264_videotoolbox": "apple",
+    }
+    detected_vendors = {gpu.vendor for gpu in hardware.gpus}
+    codec = next((
+        name for name in _ENCODER_PREFERENCE
+        if encoder_probes.get(name)
+        and (
+            name not in codec_vendors
+            or not detected_vendors
+            or codec_vendors[name] in detected_vendors
+        )
+    ), "libx264")
     available_gib = hardware.ram_available / GIB if hardware.ram_available else 2.0
     cpu_limit = max(1, hardware.cpu_physical // 2)
     memory_limit = max(1, int(available_gib // 3))
     render_slots = min(4, cpu_limit, memory_limit)
-    gpu_codec_vendor = {"h264_nvenc": "nvidia", "h264_amf": "amd"}
-    codec_vendor = gpu_codec_vendor.get(codec)
+    codec_vendor = codec_vendors.get(codec)
     matching_vram = [
         gpu.vram_total for gpu in hardware.gpus
         if gpu.vendor == codec_vendor and gpu.vram_total
@@ -917,18 +1186,20 @@ class PerformanceTelemetry:
                 available = int(_psutil.virtual_memory().available)
             except Exception:
                 pass
-        try:
-            result = _run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
-                timeout=3.0,
-            )
-            if result.returncode == 0:
-                rows = [[float(value.strip()) for value in line.split(",")] for line in result.stdout.splitlines() if line.strip()]
-                if rows:
-                    gpu_percent = max(row[0] for row in rows)
-                    gpu_memory = int(sum(row[1] for row in rows) * 1024**2)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
+        vendor_metrics = _nvidia_gpus()
+        if os.name == "nt":
+            vendor_metrics += _amd_adl_gpus()
+        percentages = [
+            gpu.utilization_percent for gpu in vendor_metrics
+            if gpu.utilization_percent is not None
+        ]
+        memory_values = [
+            gpu.vram_used for gpu in vendor_metrics if gpu.vram_used is not None
+        ]
+        if percentages:
+            gpu_percent = max(percentages)
+        if memory_values:
+            gpu_memory = sum(memory_values)
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO resource_samples (task_id, sampled_at, cpu_percent, rss_bytes, ram_available, gpu_percent, gpu_memory_used) VALUES (?, ?, ?, ?, ?, ?, ?)",

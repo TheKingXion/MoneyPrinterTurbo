@@ -512,6 +512,7 @@
     "Free disk": "Disco libre",
     "Encoder": "Codificador",
     "CPU sensor": "Sensor CPU",
+    "CPU sensor unavailable": "El sensor de temperatura CPU no está disponible. En Windows, ejecuta Libre Hardware Monitor con WMI habilitado para mostrarlo.",
     "Vendor": "Fabricante",
     "Total VRAM": "VRAM total",
     "Free VRAM": "VRAM libre",

@@ -1,7 +1,9 @@
 import json
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import closing
 from dataclasses import replace
@@ -72,12 +74,50 @@ class PerformanceProfileTests(unittest.TestCase):
             },
         ]))
 
-        with patch.object(performance, "_run", return_value=inventory):
+        with patch.object(performance, "_windows_registry_gpus", return_value=()), patch.object(
+            performance, "_run", return_value=inventory
+        ):
             gpus = performance._windows_gpus()
 
         self.assertEqual([gpu.vendor for gpu in gpus], ["amd", "intel", "unknown"])
         self.assertIsNone(gpus[0].vram_total)
         self.assertIsNone(gpus[1].vram_total)
+
+    def test_windows_registry_uses_64_bit_vram_without_wmi(self):
+        values = {
+            "DriverDesc": "AMD Radeon RX 580 2048SP",
+            "MatchingDeviceId": "PCI\\VEN_1002&DEV_6FDF",
+            "DriverVersion": "31.0",
+            "ProviderName": "Advanced Micro Devices, Inc.",
+            "HardwareInformation.qwMemorySize": 8 * performance.GIB,
+        }
+
+        class FakeKey:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_winreg = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=object(),
+            OpenKey=lambda parent, name: FakeKey(name),
+            QueryInfoKey=lambda key: (1, 0, 0),
+            EnumKey=lambda key, index: "0000",
+            QueryValueEx=lambda key, name: (values[name], 0),
+        )
+        with patch.object(performance.os, "name", "nt"), patch.dict(
+            sys.modules, {"winreg": fake_winreg}
+        ):
+            gpus = performance._windows_registry_gpus()
+
+        self.assertEqual(len(gpus), 1)
+        self.assertEqual(gpus[0].vram_total, 8 * performance.GIB)
+        self.assertEqual(gpus[0].vendor, "amd")
+        self.assertEqual(gpus[0].metrics_source, "Windows registry")
 
     def test_windows_inventory_merges_available_nvidia_telemetry(self):
         inventory = performance.GPUInfo(
@@ -93,6 +133,24 @@ class PerformanceProfileTests(unittest.TestCase):
         self.assertEqual(merged[0].driver_version, "new")
         self.assertEqual(merged[0].temperature_c, 55)
         self.assertEqual(merged[0].metrics_source, "nvidia-smi")
+
+    def test_single_vendor_telemetry_merges_and_calculates_free_vram(self):
+        inventory = performance.GPUInfo(
+            "AMD Radeon RX 580", 8 * performance.GIB, None, "31.0", vendor="amd"
+        )
+        telemetry = performance.GPUInfo(
+            "AMD adapter DEADBEEF", None, None, "", 52, "amd",
+            utilization_percent=73, vram_used=2 * performance.GIB,
+            metrics_source="AMD ADL",
+        )
+
+        merged = performance._merge_gpus((inventory,), (telemetry,))
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].temperature_c, 52)
+        self.assertEqual(merged[0].utilization_percent, 73)
+        self.assertEqual(merged[0].vram_free, 6 * performance.GIB)
+        self.assertEqual(merged[0].metrics_source, "AMD ADL")
 
     def test_linux_inventory_uses_device_name_and_merges_by_pci_bus(self):
         lspci = completed(
@@ -244,6 +302,23 @@ class PerformanceProfileTests(unittest.TestCase):
         self.assertEqual(profile.h264_codec, "h264_amf")
         self.assertEqual(profile.render_slots, 1)
 
+    def test_profile_does_not_select_encoder_for_absent_gpu_vendor(self):
+        hardware = performance.HardwareInfo(
+            8, 16, 16 * performance.GIB, 10 * performance.GIB,
+            100 * performance.GIB, 50 * performance.GIB, "Windows",
+            (performance.GPUInfo(
+                "Radeon", 8 * performance.GIB, None, "test", vendor="amd"
+            ),),
+        )
+
+        profile = performance.derive_profile(
+            hardware,
+            performance.FFmpegCapabilities("ffmpeg", "v"),
+            {"h264_nvenc": True, "h264_amf": True, "libx264": True},
+        )
+
+        self.assertEqual(profile.h264_codec, "h264_amf")
+
     def test_probe_cache_reused_and_fingerprint_invalidates_it(self):
         hardware = performance.HardwareInfo(4, 8, 8 * performance.GIB, 6 * performance.GIB, 100 * performance.GIB, 50 * performance.GIB, "test")
         ffmpeg = performance.FFmpegCapabilities("missing-ffmpeg", "v1", frozenset({"libx264"}))
@@ -259,7 +334,7 @@ class PerformanceProfileTests(unittest.TestCase):
         self.assertEqual(first.fingerprint, second.fingerprint)
         self.assertEqual(probe.call_count, 2)
         cache = json.loads((self.storage / "performance_profile.json").read_text())
-        self.assertEqual(cache["version"], 3)
+        self.assertEqual(cache["version"], 4)
 
 class TelemetryTests(unittest.TestCase):
     def setUp(self):

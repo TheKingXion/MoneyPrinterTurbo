@@ -58,7 +58,9 @@ class TaskManager:
         try:
             func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
         except Exception:
-            logger.exception(f"task failed: {func.__name__}")
+            function_name = getattr(func, "__name__", type(func).__name__)
+            logger.exception(f"task failed: {function_name}")
+            raise
         finally:
             self.task_done()
 
@@ -77,6 +79,10 @@ class TaskManager:
                     self.execute_task(func, *args, **kwargs)
                 except Exception:
                     self.current_tasks -= 1
+                    # Starting a worker can fail transiently (thread limits,
+                    # interpreter shutdown). Preserve the dequeued task so a
+                    # later queue check can retry it instead of losing work.
+                    self.enqueue(task_info)
                     raise
 
     def task_done(self):

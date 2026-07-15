@@ -27,14 +27,17 @@ class RedisTaskManager(TaskManager):
         return "task_queue"
 
     def enqueue(self, task: Dict):
-        task_with_serializable_params = task.copy()
+        task_with_serializable_params = {
+            **task,
+            "kwargs": dict(task.get("kwargs", {})),
+        }
 
         if "params" in task["kwargs"] and isinstance(
             task["kwargs"]["params"], VideoParams
         ):
             task_with_serializable_params["kwargs"]["params"] = task["kwargs"][
                 "params"
-            ].dict()
+            ].model_dump(warnings=False)
 
         # 将函数对象转换为其名称
         task_with_serializable_params["func"] = task["func"].__name__

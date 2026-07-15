@@ -37,8 +37,12 @@ def render(tr) -> None:
         metrics[4].metric(tr("Free disk"), _gib(hardware.disk_free))
         metrics[5].metric(tr("Encoder"), profile.h264_codec)
 
+        if hardware.cpu_name:
+            st.caption(f"CPU: {hardware.cpu_name}")
         if hardware.cpu_temperature_source:
             st.caption(f"{tr('CPU sensor')}: {hardware.cpu_temperature_source}")
+        elif hardware.cpu_temperature_c is None:
+            st.caption(tr("CPU sensor unavailable"))
 
         if hardware.gpus:
             st.dataframe(

@@ -5,6 +5,41 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.3] - 2026-07-15
+
+### Added
+
+- Privilege-free Windows GPU inventory using the 64-bit display-driver registry
+  values, including accurate dedicated VRAM above 4 GB.
+- Native AMD ADL telemetry for GPU temperature, utilization, and dedicated VRAM
+  usage without requiring a separate monitoring application.
+- CPU model detection and an explicit explanation when Windows cannot expose a
+  trustworthy CPU temperature sensor.
+
+### Changed
+
+- Hardware encoder selection now ignores vendor-specific encoders when the
+  matching GPU vendor is absent.
+- AMD and NVIDIA live metrics feed both the hardware panel and task telemetry.
+- Windows avoids slow or permission-sensitive WMI inventory when the display
+  registry already contains complete adapter information.
+- Advanced the fork version from `1.3.2+custom.2` to `1.3.2+custom.3`.
+
+### Fixed
+
+- GPU detection no longer fails when `Win32_VideoController` access is denied.
+- AMD cards report their real 64-bit VRAM instead of an overflowed 4 GB value.
+- RX 400/500-series and newer supported Radeon cards can report temperature and
+  load through the AMD driver shipped with Windows.
+- Adaptive rendering no longer selects NVIDIA, AMD, Intel, or Apple encoders
+  solely because a stale encoder probe succeeds.
+- Queued generation work is restored if a background worker cannot start,
+  preventing silent task loss and blocking queue reads.
+- Redis queue serialization no longer mutates the caller's `VideoParams`, and
+  task failure logging handles callable objects without a `__name__`.
+- Restored the agent helper's provider reuse, secret-safe configuration,
+  Pexels validation, dependency execution, and final-video result contract.
+
 ## [1.3.2+custom.2] - 2026-07-15
 
 ### Added
