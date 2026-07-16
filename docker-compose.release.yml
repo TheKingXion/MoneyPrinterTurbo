@@ -1,21 +1,26 @@
 x-common-volumes: &common-volumes
-  - ./config.toml:/MoneyPrinterTurbo/config.toml
+  - ./config:/MoneyPrinterTurbo/config
   - ./storage:/MoneyPrinterTurbo/storage
+
+x-common-environment: &common-environment
+  MPT_CONFIG_FILE: /MoneyPrinterTurbo/config/config.toml
 
 services:
   webui:
-    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    image: ghcr.io/thekingxion/moneyprinterturbo:${MPT_IMAGE_TAG:-latest}
     container_name: "moneyprinterturbo-webui"
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
+    environment: *common-environment
     volumes: *common-volumes
     restart: always
   api:
-    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    image: ghcr.io/thekingxion/moneyprinterturbo:${MPT_IMAGE_TAG:-latest}
     container_name: "moneyprinterturbo-api"
     ports:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
+    environment: *common-environment
     volumes: *common-volumes
     restart: always

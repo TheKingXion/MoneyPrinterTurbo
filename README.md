@@ -224,12 +224,15 @@ git clone https://github.com/harry0703/MoneyPrinterTurbo.git
 
 ```shell
 cd MoneyPrinterTurbo
+mkdir config
+cp config.example.toml config/config.toml
+mkdir storage
 docker compose -f docker-compose.release.yml up
 ```
 
-> 默认推荐使用 `docker-compose.release.yml`，它会直接拉取 GitHub Container Registry 上的预构建镜像：`ghcr.io/harry0703/moneyprinterturbo:latest`。
+> 默认推荐使用 `docker-compose.release.yml`，它会拉取此分支的镜像：`ghcr.io/thekingxion/moneyprinterturbo:latest`。可以通过 `MPT_IMAGE_TAG` 固定不可变的发布标签。
 > 如果你需要本地重新构建镜像，可以继续使用 `docker compose up`。
-> 注意：首次启动前请确保项目根目录下存在 `config.toml`，可以从 `config.example.toml` 复制一份。
+> Release Compose 会挂载可写的 `config/` 和 `storage/` 目录，配置文件路径为 `config/config.toml`。
 
 #### ② 访问Web界面
 

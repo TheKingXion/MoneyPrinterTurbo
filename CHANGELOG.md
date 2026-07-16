@@ -5,6 +5,47 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.7] - 2026-07-15
+
+### Added
+
+- Versioned per-task manifests with atomic persistence and resumable cache hits
+  for scripts, search terms, narration, and subtitles.
+- Thread-safe local WebUI jobs with isolated configuration snapshots, bounded
+  log queues, persistent results, and responsive progress polling.
+- Safe upload utilities with streaming limits, generated names, validation,
+  filesystem synchronization, and atomic publication.
+- Python 3.11 and 3.12 CI coverage with locked development tools and Ruff gates.
+
+### Changed
+
+- Redis task state and queues use separate `mpt:task:*` and `mpt:queue:*`
+  namespaces, atomic hash updates, durable processing receipts, legacy queue
+  migration, and startup recovery.
+- Video concat, mux, image preprocessing, and final rendering publish validated
+  non-empty outputs from same-directory partial files.
+- Performance hardware and encoder benchmarks now run on demand instead of
+  delaying every initial WebUI render.
+- Docker CPU and GPU images install the exact `uv.lock` environment, run as an
+  unprivileged user through a mount-preparing entrypoint, and release images
+  resolve from the TheKingXion namespace.
+- Advanced the fork version from `1.3.2+custom.6` to `1.3.2+custom.7`.
+
+### Fixed
+
+- Unhandled generation errors now leave tasks in `FAILED` instead of permanent
+  `PROCESSING`, and enqueue failures no longer leave orphan task state.
+- Performance telemetry failures are rate-limited and best-effort, preserving
+  the original task result or exception when SQLite is unavailable.
+- TikTok upload chunk counts use ceiling division, reject incomplete transfers,
+  and persist the remote publish ID before the first data chunk is sent.
+- Local uploads no longer load complete files into memory, overwrite active
+- Shared configuration and upload directories use interprocess file locks, and
+  WebUI uploads validate their real audio or visual streams before publication.
+- Video and audio resources are closed and temporary outputs are removed across
+- Concurrent renders no longer share deterministic partial output or concat-list
+  names on Windows and other local platforms.
+
 ## [1.3.2+custom.6] - 2026-07-15
 
 ### Changed

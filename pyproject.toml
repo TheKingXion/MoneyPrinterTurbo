@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moneyprinterturbo"
-version = "1.3.2+custom.6"
+version = "1.3.2+custom.7"
 description = "Generate short videos from prompts, local assets, subtitles, and TTS."
 readme = "README-en.md"
 requires-python = ">=3.11,<3.13"
@@ -52,6 +52,22 @@ g4f = [
 twelvelabs = [
     "twelvelabs>=1.2.8",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.11,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Gate parser-level errors first; broader rules need a separate baseline cleanup.
+select = ["E9", "F63", "F7"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

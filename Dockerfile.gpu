@@ -1,19 +1,23 @@
 # Use NVIDIA CUDA runtime as parent image (includes CUDA 12.1 + cuDNN 8)
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /uvx /bin/
+
 # Avoid interactive timezone prompt
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
-RUN chmod 777 /MoneyPrinterTurbo
 
-ENV PYTHONPATH="/MoneyPrinterTurbo"
+ENV PYTHONPATH="/MoneyPrinterTurbo" \
+    PATH="/MoneyPrinterTurbo/.venv/bin:$PATH" \
+    MPT_CONFIG_FILE="/MoneyPrinterTurbo/config/config.toml"
 
 # Install Python 3.11 and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         git \
+        gosu \
         ffmpeg \
         curl \
         && add-apt-repository ppa:deadsnakes/ppa \
@@ -28,21 +32,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         && apt-get remove -y python3-blinker || true \
         && rm -rf /var/lib/apt/lists/*
 
-# Copy only the requirements.txt first to leverage Docker cache
-COPY requirements.txt ./
-
-# Install Python dependencies
-RUN python3 -m pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    --retries 3 --timeout 60 -r requirements.txt
+# Install the exact locked runtime environment before copying application sources.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 # Now copy the rest of the codebase into the image
 COPY . .
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin mpt \
+    && mkdir -p /MoneyPrinterTurbo/config /MoneyPrinterTurbo/storage \
+    && chown -R mpt:mpt /MoneyPrinterTurbo/config /MoneyPrinterTurbo/storage \
+    && chmod +x /MoneyPrinterTurbo/docker-entrypoint.sh
+
+ENTRYPOINT ["/MoneyPrinterTurbo/docker-entrypoint.sh"]
 
 # Expose the port the app runs on
 EXPOSE 8501

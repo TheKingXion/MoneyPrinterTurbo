@@ -1,4 +1,4 @@
-# MoneyPrinterTurbo 1.3.2+custom.6 configuration example.
+# MoneyPrinterTurbo 1.3.2+custom.7 configuration example.
 # Keep API keys in config.toml and do not commit that local file.
 log_level = "DEBUG"
 listen_host = "127.0.0.1" # Local-only by default; do not expose unauthenticated APIs.

@@ -31,6 +31,13 @@ Live provider tests are skipped by default. To run tests that may call external
 TTS or LLM services, set `MPT_RUN_INTEGRATION_TESTS=1` and provide the required
 provider credentials.
 
+CI runs pytest over the tracked `test/` suite, but explicitly excludes
+`test_llm.py`, `test_twelvelabs.py`, and `test_voice.py`. These modules mix
+hermetic tests with live provider, external binary, or machine-local
+configuration checks. `test_task.py` remains in the required gate; its live
+end-to-end case is protected by `MPT_RUN_INTEGRATION_TESTS`. Keep the remaining
+exclusions visible until those cases are split into a marked integration suite.
+
 ## Adding New Tests
 
 To add tests for other components, follow these guidelines:

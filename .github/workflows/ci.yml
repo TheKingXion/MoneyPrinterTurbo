@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches:
@@ -8,8 +9,12 @@ on:
 
 jobs:
   tests:
-    name: Python tests
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Check out repository
@@ -18,7 +23,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -28,8 +33,18 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Validate lock file
+        run: uv lock --check
+
       - name: Compile Python sources
         run: uv run python -m compileall app cli.py main.py webui test
 
-      - name: Run deterministic unit tests
-        run: uv run python -X utf8 -m unittest test.services.test_state test.services.test_task test.services.test_schema test.services.test_webui_i18n
+      - name: Lint Python sources
+        run: uv run ruff check app cli.py main.py webui test
+
+      - name: Run hermetic pytest suite
+        run: >-
+          uv run python -X utf8 -m pytest
+          --ignore=test/services/test_llm.py
+          --ignore=test/services/test_twelvelabs.py
+          --ignore=test/services/test_voice.py

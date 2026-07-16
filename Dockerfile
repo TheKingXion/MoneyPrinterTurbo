@@ -1,18 +1,18 @@
 # Use an official Python runtime as a parent image
 FROM python:3.11-slim-bullseye
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /uvx /bin/
+
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
 
-# 设置/MoneyPrinterTurbo目录权限为777
-RUN chmod 777 /MoneyPrinterTurbo
-
-ENV PYTHONPATH="/MoneyPrinterTurbo"
+ENV PYTHONPATH="/MoneyPrinterTurbo" \
+    PATH="/MoneyPrinterTurbo/.venv/bin:$PATH" \
+    MPT_CONFIG_FILE="/MoneyPrinterTurbo/config/config.toml"
 
 # 本地用户默认继续优先使用国内镜像；GitHub Actions 发布 GHCR 镜像时使用 default，
 # 避免海外 runner 访问国内镜像过慢导致镜像发布长时间卡住。
 ARG DOCKER_BUILD_MIRROR=china
-ARG PIP_USE_OFFICIAL=0
 
 # Install system dependencies with retry logic
 RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
@@ -26,6 +26,7 @@ RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
             echo "Attempt $i: installing system dependencies"; \
             apt-get update && apt-get install -y --no-install-recommends \
                 git \
+                gosu \
                 ffmpeg && break || \
             echo "Attempt $i failed, retrying..."; \
             if [ "$DOCKER_BUILD_MIRROR" = "china" ] && [ $i -eq 3 ]; then \
@@ -35,6 +36,7 @@ RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
                 ( \
                     apt-get update && apt-get install -y --no-install-recommends \
                         git \
+                        gosu \
                         ffmpeg || \
                     ( \
                         echo "Tsinghua mirror failed, switching to default Debian mirror"; \
@@ -42,6 +44,7 @@ RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
                         sed -i 's/mirrors.tuna.tsinghua.edu.cn\/debian-security/security.debian.org/g' /etc/apt/sources.list; \
                         apt-get update && apt-get install -y --no-install-recommends \
                             git \
+                            gosu \
                             ffmpeg; \
                     ); \
                 ); \
@@ -50,20 +53,19 @@ RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
         done \
     ) && rm -rf /var/lib/apt/lists/*
 
-# Copy only the requirements.txt first to leverage Docker cache
-COPY requirements.txt ./
-
-# 本地默认优先国内 PyPI 镜像；GHCR 发布使用官方 PyPI，避免海外 runner 因跨境镜像访问变慢。
-RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
-        pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
-    else \
-        pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --retries 3 --timeout 60 -r requirements.txt || \
-        pip install --no-cache-dir -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn --retries 3 --timeout 60 -r requirements.txt || \
-        pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
-    fi
+# Install the exact locked runtime environment before copying application sources.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 # Now copy the rest of the codebase into the image
 COPY . .
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin mpt \
+    && mkdir -p /MoneyPrinterTurbo/config /MoneyPrinterTurbo/storage \
+    && chown -R mpt:mpt /MoneyPrinterTurbo/config /MoneyPrinterTurbo/storage \
+    && chmod +x /MoneyPrinterTurbo/docker-entrypoint.sh
+
+ENTRYPOINT ["/MoneyPrinterTurbo/docker-entrypoint.sh"]
 
 # Expose the port the app runs on
 EXPOSE 8501
@@ -77,6 +79,6 @@ CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--serve
 
 # 2. Run the Docker container using the following command
 ## For Linux or MacOS:
-# docker run -v $(pwd)/config.toml:/MoneyPrinterTurbo/config.toml -v $(pwd)/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
+# docker run -v $(pwd)/config:/MoneyPrinterTurbo/config -v $(pwd)/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
 ## For Windows:
-# docker run -v ${PWD}/config.toml:/MoneyPrinterTurbo/config.toml -v ${PWD}/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
+# docker run -v ${PWD}/config:/MoneyPrinterTurbo/config -v ${PWD}/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
