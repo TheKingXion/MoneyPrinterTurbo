@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import html
 import json
@@ -43,6 +44,8 @@ from app.services import cache_manager, llm, video, voice
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services.local_jobs import JobAlreadyRunningError, local_job_runner
+from app.utils import upload as upload_utils
 from app.utils import utils
 from webui.components import social_metadata, tiktok_panel, youtube_panel
 
@@ -186,27 +189,39 @@ def _detect_audio_mime(audio_file: str, audio_bytes: bytes) -> str:
     }.get(ext, "audio/mp3")
 
 
-def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, prefix):
-    """为浏览器上传文件生成受控的服务端保存路径。"""
+def _save_uploaded_file(
+    uploaded_file,
+    target_dir,
+    allowed_extensions,
+    *,
+    max_file_mb,
+    max_total_mb,
+    validate=None,
+):
+    """Stream a browser upload to an atomically published server-side file."""
     original_name = os.path.basename(str(uploaded_file.name or ""))
     extension = os.path.splitext(original_name)[1].lower()
     if extension not in allowed_extensions:
-        logger.warning(
-            f"reject unsupported uploaded file extension: {original_name or '<empty>'}"
-        )
         raise ValueError("unsupported uploaded file type")
-
-    normalized_target_dir = os.path.realpath(target_dir)
-    os.makedirs(normalized_target_dir, exist_ok=True)
-    # 不复用浏览器传入的文件名，避免路径分隔符、控制字符或同名覆盖。UUID 只用于
-    # 服务端落盘，不改变用户在上传控件中看到的原始名称。
-    file_path = os.path.realpath(
-        os.path.join(normalized_target_dir, f"{prefix}-{uuid4().hex}{extension}")
+    stored_name, _ = upload_utils.save_upload_atomically(
+        uploaded_file,
+        target_dir,
+        extension,
+        max_file_bytes=max(1, int(max_file_mb)) * 1024**2,
+        max_total_bytes=max(1, int(max_total_mb)) * 1024**2,
+        validate=validate,
     )
-    if os.path.commonpath([normalized_target_dir, file_path]) != normalized_target_dir:
-        logger.warning(f"invalid uploaded file path: {file_path}")
-        raise ValueError("invalid uploaded file path")
-    return file_path
+    return os.path.join(os.path.realpath(target_dir), stored_name)
+
+
+def _remove_uploaded_paths(paths):
+    for file_path in paths:
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"failed to roll back upload {file_path}: {exc}")
 
 
 def _resolve_ui_language(saved_language, browser_locale, supported_languages):
@@ -1222,6 +1237,12 @@ def open_task_folder(task_id):
             webbrowser.open(f"file://{path}")
     except Exception as e:
         logger.exception(f"failed to open task folder: task_id={task_id}, error={e}")
+
+
+def _should_open_task_folder(listen_host: str, running_in_container: bool) -> bool:
+    """Only open server-side folders for an explicitly local desktop server."""
+    host = str(listen_host or "").strip().lower().strip("[]")
+    return not running_in_container and host in {"localhost", "127.0.0.1", "::1"}
 
 
 @st.cache_resource
@@ -3170,6 +3191,106 @@ def _render_subtitle_settings(panel, params):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
 
+def _run_generation_job(task_id, params):
+    """Run generation in a worker; this function must remain Streamlit-free."""
+    logger.info(f"start generating video: task_id={task_id}")
+    logger.info(utils.to_json(params))
+    return tm.start(task_id=task_id, params=params)
+
+
+def _generation_session_id():
+    """Return a stable process-local owner id for this Streamlit session."""
+    return st.session_state.setdefault("generation_session_id", str(uuid4()))
+
+
+def _current_generation_job():
+    job = local_job_runner.get(_generation_session_id())
+    expected_job_id = st.session_state.get("generation_job_id")
+    return job if job is not None and job.job_id == expected_job_id else None
+
+
+def _append_generation_logs(records):
+    if not records:
+        return
+    stored = st.session_state.setdefault("generation_log_records", [])
+    stored.extend(records)
+    if len(stored) > 1000:
+        del stored[:-1000]
+
+
+def _render_generation_result(payload):
+    if not payload:
+        return
+    if payload.get("error"):
+        st.error(tr("Video Generation Failed"))
+        return
+
+    result = payload.get("result")
+    if not result or "videos" not in result:
+        st.error(tr("Video Generation Failed"))
+        return
+
+    st.success(tr("Video Generation Completed"))
+    video_files = result.get("videos", [])
+    try:
+        if video_files:
+            player_cols = st.columns(len(video_files) * 2 + 1)
+            for i, url in enumerate(video_files):
+                player_cols[i * 2 + 1].video(url)
+    except Exception as e:
+        logger.exception(
+            "failed to render generated video preview: "
+            f"task_id={payload.get('task_id')}, video_files={video_files}, error={e}"
+        )
+
+
+@st.fragment(run_every="1s")
+def _render_generation_progress():
+    """Poll the worker and perform all Streamlit updates on the script thread."""
+    session_id = _generation_session_id()
+    expected_job_id = st.session_state.get("generation_job_id")
+    job = local_job_runner.get(session_id)
+
+    if job is not None and job.job_id == expected_job_id:
+        _append_generation_logs(job.drain_logs())
+        if job.done:
+            try:
+                result = copy.deepcopy(job.result())
+                _append_generation_logs(job.drain_logs())
+                payload = {"task_id": job.job_id, "result": result}
+            except Exception as e:
+                _append_generation_logs(job.drain_logs())
+                payload = {"task_id": job.job_id, "result": None, "error": str(e)}
+                logger.error(f"video generation failed: task_id={job.job_id}, error={e}")
+
+            st.session_state["last_generation_result"] = payload
+            st.session_state.pop("generation_job_id", None)
+            _remove_active_generation_task(job.job_id)
+            local_job_runner.discard(session_id, job.job_id)
+            if not payload.get("error") and payload.get("result"):
+                if _should_open_task_folder(
+                    config.listen_host, config.is_running_in_container()
+                ):
+                    open_task_folder(job.job_id)
+                logger.info(f"video generation completed: task_id={job.job_id}")
+    elif expected_job_id:
+        # The process-local registry may be empty after a server restart. Do not
+        # leave the session permanently blocked by stale Streamlit state.
+        st.session_state.pop("generation_job_id", None)
+        _remove_active_generation_task(expected_job_id)
+        st.session_state["last_generation_result"] = {
+            "task_id": expected_job_id,
+            "result": None,
+            "error": "background job is no longer available",
+        }
+
+    if st.session_state.get("generation_job_id"):
+        st.info(tr("Generating Video"))
+    log_container = st.empty()
+    render_generation_logs(log_container)
+    _render_generation_result(st.session_state.get("last_generation_result"))
+
+
 def _render_generation_controls(
     params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
 ):
@@ -3204,11 +3325,12 @@ def _render_generation_controls(
         type="primary",
         key="generate_video_button",
         on_click=_prepare_generation_task,
+        disabled=_current_generation_job() is not None,
     )
     render_onboarding_tour()
-    log_container = st.empty()
     if start_button:
         st.session_state["generation_log_records"] = []
+        st.session_state.pop("last_generation_result", None)
         config.save_config()
         task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
         _add_active_generation_task(
@@ -3271,21 +3393,23 @@ def _render_generation_controls(
             st.error(tr("Task Restore Custom Audio Warning"))
             st.stop()
 
+        created_uploads = []
         if uploaded_audio_file:
             task_dir = utils.task_dir(task_id)
             try:
-                custom_audio_path = _build_uploaded_file_path(
+                custom_audio_path = _save_uploaded_file(
                     uploaded_audio_file,
                     task_dir,
                     CUSTOM_AUDIO_EXTENSIONS,
-                    "custom-audio",
+                    max_file_mb=config.app.get("custom_audio_upload_max_file_mb", 200),
+                    max_total_mb=config.app.get("custom_audio_upload_max_total_mb", 500),
+                    validate=upload_utils.validate_audio_media,
                 )
-            except ValueError:
+            except (ValueError, upload_utils.UploadRejectedError, upload_utils.UploadStorageError):
                 _remove_active_generation_task(task_id)
                 st.error(tr("Unsupported Upload File Type"))
                 st.stop()
-            with open(custom_audio_path, "wb") as f:
-                f.write(uploaded_audio_file.getbuffer())
+            created_uploads.append(custom_audio_path)
             params.custom_audio_file = custom_audio_path
 
         if uploaded_bgm_file and bgm_service.should_use_bgm(
@@ -3296,10 +3420,12 @@ def _render_generation_controls(
                     uploaded_bgm_file.name, uploaded_bgm_file
                 )
             except bgm_service.BgmUploadError:
+                _remove_uploaded_paths(created_uploads)
                 _remove_active_generation_task(task_id)
                 st.error(tr("Invalid Background Music"))
                 st.stop()
             except bgm_service.BgmServiceError:
+                _remove_uploaded_paths(created_uploads)
                 _remove_active_generation_task(task_id)
                 st.error(tr("Background Music Validation Failed"))
                 st.stop()
@@ -3313,29 +3439,31 @@ def _render_generation_controls(
             persisted_local_materials = []
             for file in uploaded_files:
                 try:
-                    file_path = _build_uploaded_file_path(
+                    file_path = _save_uploaded_file(
                         file,
                         local_videos_dir,
                         LOCAL_MATERIAL_EXTENSIONS,
-                        "material",
+                        max_file_mb=config.app.get("video_material_upload_max_file_mb", 512),
+                        max_total_mb=config.app.get("video_material_upload_max_total_mb", 10240),
+                        validate=upload_utils.validate_visual_media,
                     )
-                except ValueError:
+                except (ValueError, upload_utils.UploadRejectedError, upload_utils.UploadStorageError):
+                    _remove_uploaded_paths(created_uploads)
                     _remove_active_generation_task(task_id)
                     st.error(tr("Unsupported Upload File Type"))
                     st.stop()
-                with open(file_path, "wb") as f:
-                    f.write(file.getbuffer())
-                    m = MaterialInfo()
-                    m.provider = "local"
-                    m.url = file_path
-                    params.video_materials.append(m)
-                    persisted_local_materials.append(
-                        {
-                            "provider": m.provider,
-                            "url": m.url,
-                            "duration": m.duration,
-                        }
-                    )
+                created_uploads.append(file_path)
+                m = MaterialInfo()
+                m.provider = "local"
+                m.url = file_path
+                params.video_materials.append(m)
+                persisted_local_materials.append(
+                    {
+                        "provider": m.provider,
+                        "url": m.url,
+                        "duration": m.duration,
+                    }
+                )
             # 将已上传并保存到本地的视频素材写入会话，供后续只改文案时直接复用。
             st.session_state["local_video_materials"] = persisted_local_materials
         elif (
@@ -3351,50 +3479,34 @@ def _render_generation_controls(
                 if m.url:
                     params.video_materials.append(m)
 
-        def log_received(msg):
-            if config.ui["hide_log"]:
-                return
-            records = st.session_state.setdefault("generation_log_records", [])
-            records.append(str(msg).rstrip())
-            # 日志用于 WebUI 诊断，不需要无限增长；限制数量避免长任务反复
-            # rerun 后页面负担过重。
-            if len(records) > 1000:
-                del records[:-1000]
-            render_generation_logs(log_container)
-
-        log_handler_id = logger.add(log_received)
         try:
             st.toast(tr("Generating Video"))
             logger.info(tr("Start Generating Video"))
-            logger.info(utils.to_json(params))
 
+            # Config sections are process-global and may be edited by another WebUI
+            # session. Capture both inputs atomically, then let the long-running task
+            # read the contextual snapshot without retaining the global write lock.
             with config.runtime_config_lock():
-                result = tm.start(task_id=task_id, params=params)
-            if not result or "videos" not in result:
-                st.error(tr("Video Generation Failed"))
-                logger.error(tr("Video Generation Failed"))
-                st.stop()
+                generation_params = copy.deepcopy(params)
+                generation_config = config.snapshot_runtime_config()
 
-            video_files = result.get("videos", [])
-            st.success(tr("Video Generation Completed"))
-            try:
-                if video_files:
-                    player_cols = st.columns(len(video_files) * 2 + 1)
-                    for i, url in enumerate(video_files):
-                        player_cols[i * 2 + 1].video(url)
-            except Exception as e:
-                logger.exception(
-                    f"failed to render generated video preview: task_id={task_id}, "
-                    f"video_files={video_files}, error={e}"
-                )
-
-            open_task_folder(task_id)
-            logger.info(tr("Video Generation Completed"))
-        finally:
+            local_job_runner.submit(
+                _generation_session_id(),
+                task_id,
+                lambda: _run_generation_job(task_id, generation_params),
+                config_snapshot=generation_config,
+            )
+            st.session_state["generation_job_id"] = task_id
+        except JobAlreadyRunningError:
+            _remove_uploaded_paths(created_uploads)
+            st.warning(tr("Generating Video"))
             _remove_active_generation_task(task_id)
-            remove_logger_handler_safely(log_handler_id)
+        except Exception:
+            _remove_uploaded_paths(created_uploads)
+            _remove_active_generation_task(task_id)
+            raise
 
-    render_generation_logs(log_container)
+    _render_generation_progress()
 
 
 def _render_application():

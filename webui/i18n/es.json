@@ -523,6 +523,8 @@
     "Inventory only": "Solo inventario",
     "Process CPU": "CPU del proceso",
     "Process RAM": "RAM del proceso",
-    "Used VRAM": "VRAM usada"
+    "Used VRAM": "VRAM usada",
+    "Analyze performance": "Analizar rendimiento",
+    "Performance details run hardware and encoder checks on demand.": "Los detalles de rendimiento ejecutan comprobaciones de hardware y codificadores bajo demanda."
   }
 }

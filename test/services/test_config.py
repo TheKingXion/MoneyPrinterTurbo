@@ -103,3 +103,45 @@ class TestConfigPersistence:
         worker.join(timeout=1)
         assert write_finished.is_set()
         config.app.pop("runtime_lock_test", None)
+
+    def test_runtime_config_snapshot_is_deep_and_context_local(self):
+        original = config.app.get("runtime_snapshot_test")
+        had_original = "runtime_snapshot_test" in config.app
+        try:
+            config.app["runtime_snapshot_test"] = {"nested": ["captured"]}
+            snapshot = config.snapshot_runtime_config()
+            config.app["runtime_snapshot_test"]["nested"].append("global-change")
+
+            with config.use_runtime_config(snapshot):
+                assert config.app["runtime_snapshot_test"] == {
+                    "nested": ["captured"]
+                }
+
+            assert config.app["runtime_snapshot_test"] == {
+                "nested": ["captured", "global-change"]
+            }
+        finally:
+            if had_original:
+                config.app["runtime_snapshot_test"] = original
+            else:
+                config.app.pop("runtime_snapshot_test", None)
+
+    def test_runtime_config_snapshot_context_does_not_hold_write_lock(self):
+        snapshot = config.snapshot_runtime_config()
+        write_finished = threading.Event()
+
+        def update_config():
+            config.app["runtime_snapshot_lock_test"] = "updated"
+            write_finished.set()
+
+        try:
+            with config.use_runtime_config(snapshot):
+                worker = threading.Thread(target=update_config)
+                worker.start()
+                assert write_finished.wait(timeout=1)
+                assert "runtime_snapshot_lock_test" not in config.app
+
+            worker.join(timeout=1)
+            assert config.app["runtime_snapshot_lock_test"] == "updated"
+        finally:
+            config.app.pop("runtime_snapshot_lock_test", None)

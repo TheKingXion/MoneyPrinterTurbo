@@ -523,6 +523,8 @@
     "Inventory only": "Inventory only",
     "Process CPU": "Process CPU",
     "Process RAM": "Process RAM",
-    "Used VRAM": "Used VRAM"
+    "Used VRAM": "Used VRAM",
+    "Analyze performance": "Analyze performance",
+    "Performance details run hardware and encoder checks on demand.": "Performance details run hardware and encoder checks on demand."
   }
 }

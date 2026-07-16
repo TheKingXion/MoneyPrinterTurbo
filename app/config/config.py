@@ -1,23 +1,90 @@
+import copy
 import os
 import shutil
 import socket
 import tempfile
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import toml
 from loguru import logger
 
+from app.utils.file_lock import interprocess_file_lock
+
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-config_file = f"{root_dir}/config.toml"
+config_file = os.path.abspath(
+    os.getenv("MPT_CONFIG_FILE", os.path.join(root_dir, "config.toml"))
+)
 _CONTAINER_CGROUP_MARKERS = ("docker", "containerd", "kubepods", "libpod", "podman")
 _DOCKER_HOST_GATEWAY_NAME = "host.docker.internal"
 _config_save_lock = threading.RLock()
+_runtime_config_snapshot = ContextVar("runtime_config_snapshot", default=None)
 _MISSING = object()
 
 
 class _SynchronizedConfig(dict):
     """Keep runtime config mutations synchronized with atomic saves."""
+
+    def __init__(self, section_name, values):
+        super().__init__(values)
+        self.section_name = section_name
+
+    def _read_values(self):
+        snapshot = _runtime_config_snapshot.get()
+        if snapshot is not None:
+            return snapshot[self.section_name]
+        return self
+
+    def __getitem__(self, key):
+        values = self._read_values()
+        if values is self:
+            return super().__getitem__(key)
+        return values[key]
+
+    def __contains__(self, key):
+        values = self._read_values()
+        if values is self:
+            return super().__contains__(key)
+        return key in values
+
+    def __iter__(self):
+        values = self._read_values()
+        if values is self:
+            return super().__iter__()
+        return iter(values)
+
+    def __len__(self):
+        values = self._read_values()
+        if values is self:
+            return super().__len__()
+        return len(values)
+
+    def get(self, key, default=None):
+        values = self._read_values()
+        if values is self:
+            return super().get(key, default)
+        return values.get(key, default)
+
+    def keys(self):
+        values = self._read_values()
+        return super().keys() if values is self else values.keys()
+
+    def items(self):
+        values = self._read_values()
+        return super().items() if values is self else values.items()
+
+    def values(self):
+        values = self._read_values()
+        return super().values() if values is self else values.values()
+
+    def copy(self):
+        values = self._read_values()
+        return super().copy() if values is self else values.copy()
+
+    def snapshot(self):
+        """Return a deep copy of the global values, ignoring contextual views."""
+        return copy.deepcopy(super().copy())
 
     def __setitem__(self, key, value):
         with _config_save_lock:
@@ -51,6 +118,25 @@ def runtime_config_lock():
     """Prevent other sessions from changing global config during an operation."""
     with _config_save_lock:
         yield
+
+
+def snapshot_runtime_config():
+    """Capture an isolated copy of every runtime configuration section."""
+    with _config_save_lock:
+        return {
+            section.section_name: section.snapshot()
+            for section in _runtime_config_sections
+        }
+
+
+@contextmanager
+def use_runtime_config(snapshot):
+    """Make config reads in the current execution context use a snapshot."""
+    token = _runtime_config_snapshot.set(snapshot)
+    try:
+        yield
+    finally:
+        _runtime_config_snapshot.reset(token)
 
 
 def is_running_in_container(
@@ -167,9 +253,10 @@ def get_default_ollama_base_url() -> str:
 
 
 def load_config():
-    # fix: IsADirectoryError: [Errno 21] Is a directory: '/MoneyPrinterTurbo/config.toml'
+    config_dir = os.path.dirname(config_file) or root_dir
+    os.makedirs(config_dir, exist_ok=True)
     if os.path.isdir(config_file):
-        shutil.rmtree(config_file)
+        raise IsADirectoryError(f"configuration path is a directory: {config_file}")
 
     if not os.path.isfile(config_file):
         example_file = f"{root_dir}/config.example.toml"
@@ -191,7 +278,8 @@ def load_config():
 
 def save_config():
     """Synchronize and atomically persist all runtime-managed config sections."""
-    with _config_save_lock:
+    lock_path = f"{config_file}.lock"
+    with _config_save_lock, interprocess_file_lock(lock_path):
         config_to_save = dict(_cfg)
         config_to_save["app"] = dict(app)
         config_to_save["azure"] = dict(azure)
@@ -217,7 +305,7 @@ def save_config():
             fd, temp_path = tempfile.mkstemp(
                 prefix=".config-",
                 suffix=".toml.tmp",
-                dir=root_dir,
+                dir=os.path.dirname(config_file) or root_dir,
             )
             with os.fdopen(fd, mode="w", encoding="utf-8") as f:
                 f.write(serialized_config)
@@ -232,14 +320,14 @@ def save_config():
 
 
 _cfg = load_config()
-app = _SynchronizedConfig(_cfg.get("app", {}))
-whisper = _cfg.get("whisper", {})
-proxy = _cfg.get("proxy", {})
-azure = _SynchronizedConfig(_cfg.get("azure", {}))
-siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
-elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
-chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
-youtube = _SynchronizedConfig({
+app = _SynchronizedConfig("app", _cfg.get("app", {}))
+whisper = _SynchronizedConfig("whisper", _cfg.get("whisper", {}))
+proxy = _SynchronizedConfig("proxy", _cfg.get("proxy", {}))
+azure = _SynchronizedConfig("azure", _cfg.get("azure", {}))
+siliconflow = _SynchronizedConfig("siliconflow", _cfg.get("siliconflow", {}))
+elevenlabs = _SynchronizedConfig("elevenlabs", _cfg.get("elevenlabs", {}))
+chatterbox = _SynchronizedConfig("chatterbox", _cfg.get("chatterbox", {}))
+youtube = _SynchronizedConfig("youtube", {
     "enabled": False,
     "auto_upload": False,
     "privacy_status": "private",
@@ -256,7 +344,7 @@ youtube = _SynchronizedConfig({
     "allow_remote_api": False,
     **_cfg.get("youtube", {}),
 })
-tiktok = _SynchronizedConfig({
+tiktok = _SynchronizedConfig("tiktok", {
     "enabled": False,
     "provider": "official",
     "auto_upload": False,
@@ -283,12 +371,24 @@ if os.getenv("TIKTOK_CLIENT_KEY"):
     tiktok["client_key"] = os.environ["TIKTOK_CLIENT_KEY"]
 if os.getenv("TIKTOK_CLIENT_SECRET"):
     tiktok["client_secret"] = os.environ["TIKTOK_CLIENT_SECRET"]
-ui = _SynchronizedConfig(_cfg.get(
+ui = _SynchronizedConfig("ui", _cfg.get(
     "ui",
     {
         "hide_log": False,
     },
 ))
+_runtime_config_sections = (
+    app,
+    whisper,
+    proxy,
+    azure,
+    siliconflow,
+    elevenlabs,
+    chatterbox,
+    youtube,
+    tiktok,
+    ui,
+)
 
 hostname = socket.gethostname()
 
@@ -301,7 +401,7 @@ project_description = _cfg.get(
     "<a href='https://github.com/harry0703/MoneyPrinterTurbo'>https://github.com/harry0703/MoneyPrinterTurbo</a>"
     "<br><small>Supported by <a href='https://aihubmix.com/?aff=CEve'>AIHubMix</a></small>",
 )
-project_version = "1.3.2+custom.6"
+project_version = "1.3.2+custom.7"
 reload_debug = False
 
 app["redis_host"] = os.getenv(

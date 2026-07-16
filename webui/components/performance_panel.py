@@ -19,6 +19,12 @@ def _temperature(value: int | float | None) -> str:
 
 def render(tr) -> None:
     with st.expander(tr("Performance"), expanded=False):
+        if not st.session_state.get("performance_details_enabled", False):
+            st.caption(tr("Performance details run hardware and encoder checks on demand."))
+            if st.button(tr("Analyze performance"), key="performance_enable_details"):
+                st.session_state["performance_details_enabled"] = True
+                st.rerun()
+            return
         profile = performance.get_runtime_profile()
         hardware = performance.detect_hardware()
 
