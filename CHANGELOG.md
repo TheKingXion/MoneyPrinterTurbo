@@ -5,6 +5,20 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.10] - 2026-07-16
+
+### Fixed
+
+- Custom script requirements can now be pasted into both the main generator
+  and YouTube batch editor without the browser rejecting the whole clipboard
+  value at the previous 2,000-character boundary.
+- The safely processed custom-requirements allowance is now 8,000 characters,
+  aligned across the WebUI, API request schema, and LLM service.
+
+### Changed
+
+- Advanced the fork version from `1.3.2+custom.9` to `1.3.2+custom.10`.
+
 ## [1.3.2+custom.9] - 2026-07-16
 
 ### Added

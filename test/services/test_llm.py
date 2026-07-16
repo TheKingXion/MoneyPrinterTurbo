@@ -268,6 +268,12 @@ class TestScriptPromptOptions(unittest.TestCase):
                 video_script_prompt="x" * (llm.MAX_SCRIPT_PROMPT_LENGTH + 1),
             )
 
+        request = VideoScriptRequest(
+            video_subject="café",
+            video_script_prompt="x" * 4000,
+        )
+        self.assertEqual(len(request.video_script_prompt), 4000)
+
 
 class TestLLMConnection(unittest.TestCase):
     def test_connection_sends_one_minimal_request(self):

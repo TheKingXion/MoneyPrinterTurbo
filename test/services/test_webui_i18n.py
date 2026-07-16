@@ -65,6 +65,31 @@ def _load_translation(locale):
 
 
 class TestWebuiI18n(unittest.TestCase):
+    def test_custom_script_requirements_accept_browser_paste(self):
+        inputs = []
+        for source in _webui_sources():
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                function = node.func
+                if not isinstance(function, ast.Attribute) or function.attr != "text_area":
+                    continue
+                label = node.args[0]
+                if (
+                    isinstance(label, ast.Call)
+                    and isinstance(label.func, ast.Name)
+                    and label.func.id == "tr"
+                    and label.args
+                    and isinstance(label.args[0], ast.Constant)
+                    and label.args[0].value == "Custom Script Requirements"
+                ):
+                    inputs.append(node)
+
+        self.assertEqual(len(inputs), 2)
+        for node in inputs:
+            self.assertNotIn("max_chars", {keyword.arg for keyword in node.keywords})
+
     def test_locale_json_documents_are_valid(self):
         for path in sorted(I18N_DIR.glob("*.json")):
             with self.subTest(locale=path.stem):

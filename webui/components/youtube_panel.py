@@ -477,10 +477,9 @@ def _render_batch(tr, base_params: VideoParams) -> None:
     script_prompt = st.text_area(
         tr("Custom Script Requirements"),
         height=180,
-        max_chars=2000,
         help=tr("Custom Script Requirements Placeholder"),
         key="yt_batch_script_prompt",
-    ).strip()
+    ).strip()[: llm.MAX_SCRIPT_PROMPT_LENGTH]
     instruction_columns = st.columns(2)
     st.session_state.setdefault("yt_batch_paragraph_number", 6)
     paragraph_number = int(instruction_columns[0].slider(tr("Script Paragraph Number"), 1, 10, key="yt_batch_paragraph_number"))

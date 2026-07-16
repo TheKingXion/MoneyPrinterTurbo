@@ -16,7 +16,7 @@ from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
-MAX_SCRIPT_PROMPT_LENGTH = 2000
+MAX_SCRIPT_PROMPT_LENGTH = 8000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)

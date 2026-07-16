@@ -2035,10 +2035,9 @@ def _render_script_settings(panel, params):
                     params.video_script_prompt = st.text_area(
                         tr("Custom Script Requirements"),
                         height=100,
-                        max_chars=llm.MAX_SCRIPT_PROMPT_LENGTH,
                         placeholder=tr("Custom Script Requirements Placeholder"),
                         key="video_script_prompt",
-                    ).strip()
+                    ).strip()[: llm.MAX_SCRIPT_PROMPT_LENGTH]
 
                     system_prompt = st.text_area(
                         tr("Custom System Prompt"),

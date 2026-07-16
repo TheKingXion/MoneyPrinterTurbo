@@ -4,7 +4,7 @@ description: Use this skill when the user wants a finished video from a topic, i
 compatibility: Requires terminal, network, filesystem, and long-running command support. Supports macOS and Windows and uses uv exclusively.
 metadata:
   author: "harry0703@hotmail.com"
-  version: "1.3.2+custom.9"
+  version: "1.3.2+custom.10"
   upstream: "https://github.com/harry0703/MoneyPrinterTurbo"
 ---
 
