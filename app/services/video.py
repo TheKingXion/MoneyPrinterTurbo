@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import uuid
 from contextlib import redirect_stdout
 from functools import lru_cache
 from typing import List
@@ -370,6 +371,25 @@ def _codec_write_kwargs(codec: str, kwargs: dict) -> dict:
     return options
 
 
+def _partial_output_path(output_file: str) -> str:
+    root, extension = os.path.splitext(output_file)
+    return f"{root}.{uuid.uuid4().hex}.partial{extension}"
+
+
+def _write_output_atomically(output_file: str, writer):
+    """Write a valid, non-empty sibling file before publishing the output."""
+    partial_file = _partial_output_path(output_file)
+    delete_files(partial_file)
+    try:
+        result = writer(partial_file)
+        if not os.path.isfile(partial_file) or os.path.getsize(partial_file) <= 0:
+            raise RuntimeError(f"video output was not created or is empty: {partial_file}")
+        os.replace(partial_file, output_file)
+        return result
+    finally:
+        delete_files(partial_file)
+
+
 def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
@@ -439,32 +459,35 @@ def _mux_video_with_audio_copy(
 ) -> None:
     """Attach narration without decoding an already normalized video stream."""
 
-    command = [
-        utils.get_ffmpeg_binary(),
-        "-y",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        audio_codec,
-        "-b:a",
-        audio_bitrate,
-    ]
-    if abs(float(voice_volume) - 1.0) > 0.001:
-        command.extend(["-af", f"volume={float(voice_volume):.4f}"])
-    command.extend(["-shortest", output_file])
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            (result.stderr or result.stdout or "FFmpeg audio mux failed").strip()
-        )
+    def write(partial_file: str):
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            audio_codec,
+            "-b:a",
+            audio_bitrate,
+        ]
+        if abs(float(voice_volume) - 1.0) > 0.001:
+            command.extend(["-af", f"volume={float(voice_volume):.4f}"])
+        command.extend(["-shortest", partial_file])
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout or "FFmpeg audio mux failed").strip()
+            )
+
+    _write_output_atomically(output_file, write)
 
 
 def concat_video_clips_with_ffmpeg(
@@ -474,12 +497,14 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
 ):
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
+    concat_list_file = os.path.join(
+        output_dir, f"ffmpeg-concat-list-{uuid.uuid4().hex}.txt"
+    )
     with open(concat_list_file, "w", encoding="utf-8") as fp:
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
-    def build_command(codec: str) -> list[str]:
+    def build_command(codec: str, partial_file: str) -> list[str]:
         command = [
             utils.get_ffmpeg_binary(),
             "-y",
@@ -506,11 +531,11 @@ def concat_video_clips_with_ffmpeg(
             )
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
-        command.append(output_file)
+        command.append(partial_file)
         return command
 
-    def run_concat(codec: str):
-        command = build_command(codec)
+    def run_concat(codec: str, partial_file: str):
+        command = build_command(codec, partial_file)
         # 使用 ffmpeg 一次完成串联；快速路径只封装码流，兜底路径才重新编码。
         result = subprocess.run(
             command,
@@ -523,26 +548,31 @@ def concat_video_clips_with_ffmpeg(
             raise RuntimeError(error_message or "ffmpeg concat failed")
         return codec
 
-    try:
+    def write(partial_file: str):
         try:
             # Temp clips are normalized to the same codec, FPS, canvas and pixel
             # format before this point, so avoid encoding them a second time.
-            return run_concat("copy")
+            return run_concat("copy", partial_file)
         except Exception as exc:
             logger.warning(
                 "ffmpeg stream-copy concat failed, falling back to re-encode: "
                 f"{str(exc)}"
             )
+            delete_files(partial_file)
 
         effective_codec = _get_effective_video_codec()
         try:
-            return run_concat(effective_codec)
+            return run_concat(effective_codec, partial_file)
         except Exception as exc:
             if effective_codec == _DEFAULT_VIDEO_CODEC:
                 raise
-            result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
+            delete_files(partial_file)
+            result_codec = run_concat(_DEFAULT_VIDEO_CODEC, partial_file)
             _disable_runtime_video_codec(effective_codec, str(exc))
             return result_codec
+
+    try:
+        return _write_output_atomically(output_file, write)
     finally:
         delete_files(concat_list_file)
 
@@ -572,7 +602,11 @@ def _open_image_clip_with_fallback(image_path: str):
             f"failed to open image directly, trying sanitized copy: {image_path}, error: {str(exc)}"
         )
         sanitized_path = _sanitize_image_file(image_path)
-        return ImageClip(sanitized_path), sanitized_path
+        try:
+            return ImageClip(sanitized_path), sanitized_path
+        except Exception:
+            delete_files(sanitized_path)
+            raise
 
 
 def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileClip:
@@ -608,38 +642,31 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
 def close_clip(clip):
     if clip is None:
         return
-        
-    try:
-        # close main resources
-        if hasattr(clip, 'reader') and clip.reader is not None:
-            clip.reader.close()
-            
-        # close audio resources
-        if hasattr(clip, 'audio') and clip.audio is not None:
-            if hasattr(clip.audio, 'reader') and clip.audio.reader is not None:
-                clip.audio.reader.close()
-            del clip.audio
-            
-        # close mask resources
-        if hasattr(clip, 'mask') and clip.mask is not None:
-            if hasattr(clip.mask, 'reader') and clip.mask.reader is not None:
-                clip.mask.reader.close()
-            del clip.mask
-            
-        # handle child clips in composite clips
-        if hasattr(clip, 'clips') and clip.clips:
-            for child_clip in clip.clips:
-                if child_clip is not clip:  # avoid possible circular references
-                    close_clip(child_clip)
-            
-        # clear clip list
-        if hasattr(clip, 'clips'):
-            clip.clips = []
-            
-    except Exception as e:
-        logger.error(f"failed to close clip: {str(e)}")
-    
-    del clip
+
+    children = list(getattr(clip, "clips", None) or [])
+    for child_clip in children:
+        if child_clip is not clip:
+            close_clip(child_clip)
+
+    close = getattr(clip, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            logger.error(f"failed to close clip: {str(exc)}")
+
+    # Some lightweight/fake clips do not implement close(), and partially
+    # constructed MoviePy clips may only expose one of these readers.
+    for resource in (clip, getattr(clip, "audio", None), getattr(clip, "mask", None)):
+        reader = getattr(resource, "reader", None)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception as exc:
+                logger.error(f"failed to close clip reader: {str(exc)}")
+
+    if hasattr(clip, "clips"):
+        clip.clips = []
     gc.collect()
 
 def delete_files(files: List[str] | str):
@@ -749,9 +776,11 @@ def combine_videos(
     sequential_offsets = {}
     for video_path in video_paths:
         clip = _open_video_clip_quietly(video_path)
-        clip_duration = clip.duration
-        clip_w, clip_h = clip.size
-        close_clip(clip)
+        try:
+            clip_duration = clip.duration
+            clip_w, clip_h = clip.size
+        finally:
+            close_clip(clip)
         
         start_time = 0
         if video_concat_mode.value == VideoConcatMode.sequential.value:
@@ -801,8 +830,12 @@ def combine_videos(
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
         
+        source_clip = None
+        clip = None
+        clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
         try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
+            source_clip = _open_video_clip_quietly(subclipped_item.file_path)
+            clip = source_clip.subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
             )
             clip_duration = clip.duration
@@ -847,7 +880,6 @@ def combine_videos(
                 clip = clip.subclipped(0, max_clip_duration)
                 
             # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
@@ -858,7 +890,6 @@ def combine_videos(
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
-            close_clip(clip)
 
             processed_clips.append(
                 SubClippedVideoClip(
@@ -873,6 +904,11 @@ def combine_videos(
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
+            delete_files(clip_file)
+        finally:
+            close_clip(clip)
+            if source_clip is not clip:
+                close_clip(source_clip)
     
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
     if video_duration < required_video_duration:
@@ -900,16 +936,17 @@ def combine_videos(
     
     clip_files = [clip.file_path for clip in processed_clips]
     logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
-    concat_video_clips_with_ffmpeg(
-        clip_files=clip_files,
-        output_file=combined_video_path,
-        threads=threads,
-        output_dir=output_dir,
-        max_duration=audio_duration,
-    )
-    
-    # clean temp files
-    delete_files(clip_files)
+    try:
+        concat_video_clips_with_ffmpeg(
+            clip_files=clip_files,
+            output_file=combined_video_path,
+            threads=threads,
+            output_dir=output_dir,
+            max_duration=audio_duration,
+        )
+    finally:
+        # A clip may be repeated to cover the narration, so deduplicate paths.
+        delete_files(list(dict.fromkeys(clip_files)))
             
     logger.info("video combining completed")
     return combined_video_path
@@ -1322,67 +1359,87 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
-    video_clip = _open_video_clip_quietly(video_path)
-    audio_clip = AudioFileClip(audio_path).with_effects(
-        [afx.MultiplyVolume(params.voice_volume)]
-    )
-
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=params.font_size,
+    resources = []
+    try:
+        video_clip = _open_video_clip_quietly(video_path)
+        resources.append(video_clip)
+        audio_clip = AudioFileClip(audio_path).with_effects(
+            [afx.MultiplyVolume(params.voice_volume)]
         )
+        resources.append(audio_clip)
 
-    if subtitle_path and os.path.exists(subtitle_path):
-        sub = SubtitlesClip(
-            subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
-        )
-        text_clips = []
-        for item in sub.subtitles:
-            clip = create_text_clip(subtitle_item=item)
-            text_clips.append(clip)
-        video_clip = CompositeVideoClip([video_clip, *text_clips])
-
-    bgm_file = (
-        bgm_file_override
-        if bgm_file_override is not None
-        else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
-    )
-    bgm_mix_succeeded = True
-    if bgm_file:
-        try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
+        def make_textclip(text):
+            clip = TextClip(
+                text=text,
+                font=font_path,
+                font_size=params.font_size,
             )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-        except Exception as e:
-            logger.error(f"failed to add bgm: {str(e)}")
-            bgm_mix_succeeded = False
+            resources.append(clip)
+            return clip
 
-    video_clip = video_clip.with_audio(audio_clip)
-    # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
-    # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-    _write_videofile_with_codec_fallback(
-        video_clip,
-        output_file=output_file,
-        codec=_get_configured_video_codec(),
-        audio_codec=audio_codec,
-        audio_fps=output_audio_fps,
-        audio_bitrate=audio_bitrate,
-        temp_audiofile_path=_get_temp_audio_dir(output_dir),
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-    )
-    video_clip.close()
-    del video_clip
-    return bgm_mix_succeeded
+        if subtitle_path and os.path.exists(subtitle_path):
+            sub = SubtitlesClip(
+                subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
+            )
+            resources.append(sub)
+            text_clips = []
+            for item in sub.subtitles:
+                clip = create_text_clip(subtitle_item=item)
+                resources.append(clip)
+                text_clips.append(clip)
+            video_clip = CompositeVideoClip([video_clip, *text_clips])
+            resources.append(video_clip)
+
+        bgm_file = (
+            bgm_file_override
+            if bgm_file_override is not None
+            else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+        )
+        bgm_mix_succeeded = True
+        if bgm_file:
+            try:
+                bgm_clip = AudioFileClip(bgm_file).with_effects(
+                    [
+                        afx.MultiplyVolume(params.bgm_volume),
+                        afx.AudioFadeOut(3),
+                        afx.AudioLoop(duration=video_clip.duration),
+                    ]
+                )
+                resources.append(bgm_clip)
+                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+                resources.append(audio_clip)
+            except Exception as e:
+                logger.error(f"failed to add bgm: {str(e)}")
+                bgm_mix_succeeded = False
+
+        video_clip = video_clip.with_audio(audio_clip)
+        resources.append(video_clip)
+        # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
+        # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
+        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+
+        def write(partial_file: str):
+            return _write_videofile_with_codec_fallback(
+                video_clip,
+                output_file=partial_file,
+                codec=_get_configured_video_codec(),
+                audio_codec=audio_codec,
+                audio_fps=output_audio_fps,
+                audio_bitrate=audio_bitrate,
+                temp_audiofile_path=_get_temp_audio_dir(output_dir),
+                threads=params.n_threads or 2,
+                logger=None,
+                fps=fps,
+            )
+
+        _write_output_atomically(output_file, write)
+        return bgm_mix_succeeded
+    finally:
+        closed_resources = set()
+        for resource in reversed(resources):
+            if id(resource) not in closed_resources:
+                close_clip(resource)
+                closed_resources.add(id(resource))
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -1412,6 +1469,7 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
             )
             continue
 
+        original_material_source_path = material_source_path
         ext = utils.parse_extension(material_source_path)
         try:
             # 图片素材直接按图片方式读取，避免先走 VideoFileClip 误判后触发不稳定的回退分支。
@@ -1432,6 +1490,11 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                     f"skip unreadable local material: {material.url}, error: {str(exc)}"
                 )
                 continue
+        sanitized_file = (
+            material_source_path
+            if material_source_path != original_material_source_path
+            else ""
+        )
         try:
             width = clip.size[0]
             height = clip.size[1]
@@ -1439,36 +1502,37 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 logger.warning(f"low resolution material: {width}x{height}, minimum 480x480 required")
                 # 探测到低分辨率素材后立即关闭资源，并且不要把该素材返回给后续流程。
                 close_clip(clip)
+                delete_files(sanitized_file)
                 continue
 
             if ext in const.FILE_TYPE_IMAGES:
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
-                clip = (
-                    ImageClip(material_source_path)
-                    .with_duration(clip_duration)
-                    .with_position("center")
-                )
-                # Apply a zoom effect using the resize method.
-                # A lambda function is used to make the zoom effect dynamic over time.
-                # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
-                # Note: 1 represents 100% size, so 1.2 represents 120% size.
-                zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-                )
-
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
-
-                # Output the video to a file.
-                video_file = f"{material_source_path}.mp4"
-                final_clip.write_videofile(video_file, fps=30, logger=None)
-                close_clip(clip)
-                close_clip(final_clip)
+                clip = None
+                zoom_clip = None
+                final_clip = None
+                try:
+                    clip = (
+                        ImageClip(material_source_path)
+                        .with_duration(clip_duration)
+                        .with_position("center")
+                    )
+                    zoom_clip = clip.resized(
+                        lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
+                    )
+                    final_clip = CompositeVideoClip([zoom_clip])
+                    video_file = f"{material_source_path}.mp4"
+                    _write_output_atomically(
+                        video_file,
+                        lambda partial_file: final_clip.write_videofile(
+                            partial_file, fps=30, logger=None
+                        ),
+                    )
+                finally:
+                    close_clip(final_clip)
+                    close_clip(zoom_clip)
+                    close_clip(clip)
                 material.url = video_file
                 logger.success(f"image processed: {video_file}")
             else:
@@ -1479,8 +1543,10 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 material.url = material_source_path
         except Exception:
             close_clip(clip)
+            delete_files(sanitized_file)
             raise
 
+        delete_files(sanitized_file)
         valid_materials.append(material)
 
     return valid_materials

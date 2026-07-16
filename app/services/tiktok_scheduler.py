@@ -226,6 +226,19 @@ class TikTokScheduler:
             tiktok_upload_tracker.update_status(
                 job["task_id"], "uploading", int(job.get("index", 1)), error=""
             )
+
+            def persist_publish_id(publish_id: str) -> None:
+                with self._transaction():
+                    jobs = self._load_unlocked()
+                    current = next((item for item in jobs if item.get("job_id") == job.get("job_id")), None)
+                    if not current:
+                        raise RuntimeError("TikTok scheduled job disappeared before upload")
+                    current["publish_id"] = publish_id
+                    self._save_unlocked(jobs)
+                tiktok_upload_tracker.update_status(
+                    job["task_id"], "uploading", int(job.get("index", 1)), publish_id=publish_id
+                )
+
             try:
                 result = tiktok_uploader.upload_video(
                     job["video_path"],
@@ -236,6 +249,7 @@ class TikTokScheduler:
                     job.get("allow_stitch"),
                     provider=str(job.get("provider") or ""),
                     idempotency_key=str(job.get("job_id") or f"{job['task_id']}-{job.get('index', 1)}"),
+                    on_publish_id=persist_publish_id,
                 )
             except Exception as exc:
                 result = {"success": False, "error": str(exc), "retryable": True, "status": "failed"}

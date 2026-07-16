@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -7,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -613,6 +614,7 @@ class TikTokUploader:
         allow_stitch: Optional[bool] = None,
         provider: str = "",
         idempotency_key: str = "",
+        on_publish_id: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
         self.sync_from_config()
         selected_provider = provider or self.provider
@@ -662,7 +664,7 @@ class TikTokUploader:
                 raise RuntimeError(f"Privacy level not allowed for this creator: {privacy}")
             size = os.path.getsize(video_path)
             chunk_size = min(10 * 1024 * 1024, size)
-            total_chunks = max(1, size // max(chunk_size, 1))
+            total_chunks = math.ceil(size / chunk_size)
             post_info = {
                 "title": (caption or os.path.basename(video_path))[:2200],
                 "privacy_level": privacy,
@@ -696,11 +698,19 @@ class TikTokUploader:
             publish_id = data.get("publish_id", "")
             if not upload_url or not publish_id:
                 raise RuntimeError("TikTok did not return upload_url and publish_id")
+            if on_publish_id:
+                on_publish_id(publish_id)
             with open(video_path, "rb") as video:
                 start = 0
                 for chunk_index in range(total_chunks):
                     read_size = chunk_size if chunk_index < total_chunks - 1 else size - start
                     chunk = video.read(read_size)
+                    if not chunk:
+                        raise RuntimeError(f"TikTok upload produced an empty chunk at index {chunk_index}")
+                    if len(chunk) != read_size:
+                        raise RuntimeError(
+                            f"TikTok upload read {len(chunk)} bytes for chunk {chunk_index}, expected {read_size}"
+                        )
                     end = start + len(chunk) - 1
                     upload = requests.put(
                         upload_url,
@@ -714,6 +724,8 @@ class TikTokUploader:
                     )
                     upload.raise_for_status()
                     start = end + 1
+                if start != size:
+                    raise RuntimeError(f"TikTok upload sent {start} bytes, expected {size}")
             return {"success": True, "provider": "official", "publish_id": publish_id, "status": "processing"}
         except Exception as exc:
             logger.exception(f"TikTok upload failed: {exc}")

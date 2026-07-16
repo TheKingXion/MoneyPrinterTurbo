@@ -4,7 +4,15 @@ from unittest.mock import MagicMock, patch
 
 from app.controllers.manager.base_manager import TaskQueueFullError
 from app.controllers.manager.memory_manager import InMemoryTaskManager
-from app.controllers.manager.redis_manager import RedisTaskManager
+from app.controllers.manager.redis_manager import (
+    LEGACY_QUEUE,
+    MIGRATE_LEGACY_SCRIPT,
+    PROCESSING_QUEUE,
+    RECEIPT_KEY,
+    RECOVER_PROCESSING_SCRIPT,
+    REQUEUE_SCRIPT,
+    RedisTaskManager,
+)
 from app.models.schema import VideoParams
 from app.services import task as task_service
 
@@ -103,6 +111,20 @@ class TestInMemoryTaskManager(unittest.TestCase):
         self.assertEqual(manager.current_tasks, 1)
         task_done.assert_called_once_with()
 
+    def test_resume_queued_tasks_fills_available_slots(self):
+        manager = InMemoryTaskManager(max_concurrent_tasks=2)
+        first = MagicMock()
+        second = MagicMock()
+        manager.enqueue({"func": first, "args": (), "kwargs": {}})
+        manager.enqueue({"func": second, "args": (), "kwargs": {}})
+
+        with patch.object(manager, "execute_task") as execute:
+            manager.resume_queued_tasks()
+
+        self.assertEqual(manager.current_tasks, 2)
+        self.assertEqual(execute.call_count, 2)
+        self.assertTrue(manager.is_queue_empty())
+
     def test_execute_task_starts_background_thread(self):
         """任务执行入口必须启动线程，并把函数参数完整传给 run_task。"""
         manager = InMemoryTaskManager(max_concurrent_tasks=1)
@@ -137,6 +159,7 @@ class TestRedisTaskManager(unittest.TestCase):
             max_queued_tasks=3,
         )
         from_url.assert_called_once_with("redis://localhost:6379/0")
+        self.redis_client.reset_mock()
 
     def test_enqueue_serializes_video_params_without_mutating_task(self):
         """
@@ -155,10 +178,32 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertIs(task["kwargs"]["params"], params)
         queue_name, payload = self.redis_client.rpush.call_args.args
         decoded = json.loads(payload)
-        self.assertEqual(queue_name, "task_queue")
+        self.assertEqual(queue_name, "mpt:queue:video")
         self.assertEqual(decoded["func"], "start")
         self.assertEqual(decoded["kwargs"]["task_id"], "task-1")
         self.assertEqual(decoded["kwargs"]["params"]["video_subject"], "Coffee")
+
+    def test_add_task_is_persisted_before_a_worker_starts(self):
+        self.redis_client.llen.side_effect = [0, 1]
+        self.redis_client.lmove.return_value = json.dumps(
+            {"func": "start", "args": [], "kwargs": {"task_id": "task-1"}}
+        )
+
+        with patch.object(self.manager, "execute_task") as execute_task:
+            self.manager.add_task(task_service.start, task_id="task-1")
+
+        self.assertEqual(
+            [call[0] for call in self.redis_client.method_calls],
+            ["llen", "rpush", "llen", "lmove"],
+        )
+        queue_name, payload = self.redis_client.rpush.call_args.args
+        self.assertEqual(queue_name, "mpt:queue:video")
+        self.assertEqual(json.loads(payload)["kwargs"]["task_id"], "task-1")
+        execute_task.assert_called_once_with(
+            task_service.start,
+            _task_receipt=self.redis_client.lmove.return_value,
+            task_id="task-1",
+        )
 
     def test_dequeue_restores_function_and_video_params(self):
         """从 Redis 取出的任务应恢复可调用函数和 VideoParams 模型。"""
@@ -172,23 +217,107 @@ class TestRedisTaskManager(unittest.TestCase):
                 ),
             },
         }
-        self.redis_client.lpop.return_value = json.dumps(payload)
+        receipt = json.dumps(payload)
+        self.redis_client.lmove.return_value = receipt
 
         task = self.manager.dequeue()
 
-        self.redis_client.lpop.assert_called_once_with("task_queue")
+        self.redis_client.lmove.assert_called_once_with(
+            "mpt:queue:video", PROCESSING_QUEUE, "LEFT", "RIGHT"
+        )
+        self.assertEqual(task[RECEIPT_KEY], receipt)
         self.assertIs(task["func"], task_service.start)
         self.assertIsInstance(task["kwargs"]["params"], VideoParams)
         self.assertEqual(task["kwargs"]["params"].video_subject, "Coffee")
 
     def test_empty_queue_and_size_use_redis_length(self):
         """队列判空和长度必须直接反映 Redis 当前列表长度。"""
-        self.redis_client.lpop.return_value = None
+        self.redis_client.lmove.return_value = None
         self.redis_client.llen.side_effect = [0, 2]
 
         self.assertIsNone(self.manager.dequeue())
         self.assertTrue(self.manager.is_queue_empty())
         self.assertEqual(self.manager.queue_size(), 2)
+
+    def test_initialization_migrates_legacy_and_recovers_abandoned_tasks(self):
+        redis_client = MagicMock()
+        with patch(
+            "app.controllers.manager.redis_manager.redis.Redis.from_url",
+            return_value=redis_client,
+        ):
+            RedisTaskManager(1, "redis://localhost:6379/0")
+
+        self.assertEqual(
+            redis_client.eval.call_args_list,
+            [
+                unittest.mock.call(
+                    MIGRATE_LEGACY_SCRIPT,
+                    2,
+                    LEGACY_QUEUE,
+                    "mpt:queue:video",
+                ),
+                unittest.mock.call(
+                    RECOVER_PROCESSING_SCRIPT,
+                    2,
+                    PROCESSING_QUEUE,
+                    "mpt:queue:video",
+                ),
+            ],
+        )
+
+    def test_resume_recovers_processing_before_starting_pending_tasks(self):
+        self.redis_client.llen.return_value = 0
+
+        self.manager.resume_queued_tasks()
+
+        self.redis_client.eval.assert_called_once_with(
+            RECOVER_PROCESSING_SCRIPT,
+            2,
+            PROCESSING_QUEUE,
+            "mpt:queue:video",
+        )
+
+    def test_receipt_is_acked_only_after_task_finishes(self):
+        events = []
+        receipt = b'{"func":"start"}'
+        self.redis_client.lrem.side_effect = lambda *args: events.append("ack")
+        self.redis_client.llen.return_value = 0
+
+        self.manager.current_tasks = 1
+        self.manager.run_task(
+            lambda: events.append("finished"), _task_receipt=receipt
+        )
+
+        self.assertEqual(events, ["finished", "ack"])
+        self.redis_client.lrem.assert_called_once_with(
+            PROCESSING_QUEUE, 1, receipt
+        )
+
+    def test_thread_start_failure_atomically_requeues_receipt_without_enqueue(self):
+        payload = json.dumps(
+            {"func": "start", "args": [], "kwargs": {"task_id": "task-1"}}
+        )
+        self.redis_client.llen.return_value = 1
+        self.redis_client.lmove.return_value = payload
+        self.manager.current_tasks = 1
+
+        with patch.object(
+            self.manager,
+            "execute_task",
+            side_effect=RuntimeError("thread unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                self.manager.task_done()
+
+        self.redis_client.eval.assert_called_once_with(
+            REQUEUE_SCRIPT,
+            2,
+            PROCESSING_QUEUE,
+            "mpt:queue:video",
+            payload,
+        )
+        self.redis_client.rpush.assert_not_called()
+        self.assertEqual(self.manager.current_tasks, 0)
 
 
 if __name__ == "__main__":

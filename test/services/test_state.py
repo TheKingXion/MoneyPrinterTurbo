@@ -10,9 +10,13 @@ from app.services.state import MemoryState, RedisState
 
 
 class _FakeRedis:
-    def __init__(self, batches):
+    def __init__(self, batches=()):
         self.batches = batches
         self.data = {}
+        self.scan_calls = []
+        self.hgetall_calls = []
+        self.hset_calls = []
+        self.delete_calls = []
         for key in [key for batch in batches for key in batch]:
             index = int(key.decode("utf-8").split(":")[-1])
             self.data[key] = {
@@ -21,7 +25,8 @@ class _FakeRedis:
                 b"progress": str(index).encode("utf-8"),
             }
 
-    def scan(self, cursor, count):
+    def scan(self, cursor, match, count):
+        self.scan_calls.append((cursor, match, count))
         batch_index = int(cursor)
         next_cursor = batch_index + 1
         if next_cursor >= len(self.batches):
@@ -29,7 +34,14 @@ class _FakeRedis:
         return next_cursor, self.batches[batch_index]
 
     def hgetall(self, key):
-        return self.data[key]
+        self.hgetall_calls.append(key)
+        return self.data.get(key, {})
+
+    def hset(self, key, mapping):
+        self.hset_calls.append((key, mapping))
+
+    def delete(self, *keys):
+        self.delete_calls.append(keys)
 
 
 class TestMemoryState(unittest.TestCase):
@@ -81,7 +93,7 @@ class TestMemoryState(unittest.TestCase):
 
 class TestRedisState(unittest.TestCase):
     def _build_state(self, batch_sizes):
-        keys = [f"task:{i}".encode("utf-8") for i in range(sum(batch_sizes))]
+        keys = [f"mpt:task:{i}".encode("utf-8") for i in range(sum(batch_sizes))]
         batches = []
         offset = 0
         for batch_size in batch_sizes:
@@ -111,12 +123,59 @@ class TestRedisState(unittest.TestCase):
         self.assertEqual(len(second_page), 8)
         self.assertEqual(
             [task["task_id"] for task in first_page],
-            [f"task:{i}" for i in range(10)],
+            [f"mpt:task:{i}" for i in range(10)],
         )
         self.assertEqual(
             [task["task_id"] for task in second_page],
-            [f"task:{i}" for i in range(10, 18)],
+            [f"mpt:task:{i}" for i in range(10, 18)],
         )
+
+        self.assertTrue(
+            all(call[1] == "mpt:task:*" for call in state._redis.scan_calls)
+        )
+
+    def test_update_task_uses_one_namespaced_atomic_hset(self):
+        state = RedisState.__new__(RedisState)
+        state._redis = _FakeRedis()
+
+        state.update_task("abc", state=2, progress=25, videos=["video.mp4"])
+
+        self.assertEqual(len(state._redis.hset_calls), 1)
+        key, mapping = state._redis.hset_calls[0]
+        self.assertEqual(key, "mpt:task:abc")
+        self.assertEqual(
+            mapping,
+            {
+                "task_id": "abc",
+                "state": "2",
+                "progress": "25",
+                "videos": "['video.mp4']",
+            },
+        )
+
+    def test_get_task_falls_back_to_exact_legacy_key_without_scan(self):
+        state = RedisState.__new__(RedisState)
+        state._redis = _FakeRedis()
+        state._redis.data["legacy-id"] = {
+            b"task_id": b"legacy-id",
+            b"state": b"1",
+        }
+
+        task = state.get_task("legacy-id")
+
+        self.assertEqual(task, {"task_id": "legacy-id", "state": 1})
+        self.assertEqual(
+            state._redis.hgetall_calls, ["mpt:task:legacy-id", "legacy-id"]
+        )
+        self.assertEqual(state._redis.scan_calls, [])
+
+    def test_delete_task_removes_namespaced_and_legacy_state(self):
+        state = RedisState.__new__(RedisState)
+        state._redis = _FakeRedis()
+
+        state.delete_task("abc")
+
+        self.assertEqual(state._redis.delete_calls, [("mpt:task:abc", "abc")])
 
 
 if __name__ == "__main__":

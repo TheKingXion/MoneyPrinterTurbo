@@ -337,18 +337,69 @@ class TestVideoService(unittest.TestCase):
         )
 
     def test_audio_mux_copies_video_and_applies_volume(self):
-        completed_process = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        def fake_run(command, capture_output, text, check):
+            Path(command[-1]).write_bytes(b"muxed-video")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
         with patch.object(vd.utils, "get_ffmpeg_binary", return_value="ffmpeg"):
             with patch.object(
-                vd.subprocess, "run", return_value=completed_process
+                vd.subprocess, "run", side_effect=fake_run
             ) as run:
-                vd._mux_video_with_audio_copy(
-                    "combined.mp4", "audio.mp3", "final.mp4", 0.75
-                )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    output_file = os.path.join(temp_dir, "final.mp4")
+                    vd._mux_video_with_audio_copy(
+                        "combined.mp4", "audio.mp3", output_file, 0.75
+                    )
+                    self.assertEqual(Path(output_file).read_bytes(), b"muxed-video")
+                    self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
 
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-c:v") + 1], "copy")
         self.assertEqual(command[command.index("-af") + 1], "volume=0.7500")
+
+    def test_atomic_output_failure_preserves_existing_file_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "final.mp4")
+            Path(output_file).write_bytes(b"previous-video")
+
+            def fail_after_partial_write(path):
+                Path(path).write_bytes(b"incomplete-video")
+                raise RuntimeError("encoder failed")
+
+            with self.assertRaisesRegex(RuntimeError, "encoder failed"):
+                vd._write_output_atomically(output_file, fail_after_partial_write)
+
+            self.assertEqual(Path(output_file).read_bytes(), b"previous-video")
+            self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
+
+    def test_atomic_output_rejects_empty_file_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "final.mp4")
+            with self.assertRaisesRegex(RuntimeError, "not created or is empty"):
+                vd._write_output_atomically(
+                    output_file, lambda path: Path(path).write_bytes(b"")
+                )
+
+            self.assertFalse(Path(output_file).exists())
+            self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
+
+    def test_audio_mux_failure_removes_partial_and_preserves_existing_output(self):
+        def fake_run(command, capture_output, text, check):
+            Path(command[-1]).write_bytes(b"incomplete-mux")
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="mux failed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "final.mp4")
+            Path(output_file).write_bytes(b"previous-video")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "mux failed"):
+                    vd._mux_video_with_audio_copy(
+                        "combined.mp4", "audio.mp3", output_file, 1.0
+                    )
+
+            self.assertEqual(Path(output_file).read_bytes(), b"previous-video")
+            self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
 
     def test_write_videofile_does_not_disable_codec_when_fallback_also_fails(self):
         """
@@ -399,6 +450,7 @@ class TestVideoService(unittest.TestCase):
                     stdout="",
                     stderr=f"{codec} unavailable",
                 )
+            Path(command[-1]).write_bytes(b"combined-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -452,9 +504,8 @@ class TestVideoService(unittest.TestCase):
                             threads=1,
                             output_dir=temp_dir,
                         )
-                self.assertFalse(
-                    os.path.exists(os.path.join(temp_dir, "ffmpeg-concat-list.txt"))
-                )
+                self.assertEqual(list(Path(temp_dir).glob("ffmpeg-concat-list-*.txt")), [])
+                self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
 
         self.assertNotIn("h264_nvenc", vd._runtime_disabled_video_codecs)
 
@@ -511,6 +562,119 @@ class TestVideoService(unittest.TestCase):
                 )
 
         self.assertTrue(fake_audio_clip.reader.closed)
+
+    def test_combine_videos_concat_failure_closes_clips_and_removes_temp_files(self):
+        opened_clips = []
+
+        class _FakeAudioClip:
+            duration = 1.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            duration = 2.0
+            size = (1080, 1920)
+            w = 1080
+            h = 1920
+
+            def __init__(self):
+                self.closed = False
+                opened_clips.append(self)
+
+            def subclipped(self, start_time, end_time):
+                clip = _FakeVideoClip()
+                clip.duration = end_time - start_time
+                return clip
+
+            def close(self):
+                self.closed = True
+
+        def write_temp_clip(clip, output_file, codec, **kwargs):
+            Path(output_file).write_bytes(b"temp-video")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            temp_clip = os.path.join(temp_dir, "temp-clip-1.mp4")
+            with patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()):
+                with patch.object(
+                    vd, "_open_video_clip_quietly", side_effect=lambda path: _FakeVideoClip()
+                ):
+                    with patch.object(
+                        vd,
+                        "_write_videofile_with_codec_fallback",
+                        side_effect=write_temp_clip,
+                    ):
+                        with patch.object(
+                            vd,
+                            "concat_video_clips_with_ffmpeg",
+                            side_effect=RuntimeError("concat failed"),
+                        ):
+                            with self.assertRaisesRegex(RuntimeError, "concat failed"):
+                                vd.combine_videos(
+                                    combined_video_path=output_file,
+                                    video_paths=["source.mp4"],
+                                    audio_file="audio.mp3",
+                                    video_concat_mode=vd.VideoConcatMode.sequential,
+                                )
+
+            self.assertTrue(opened_clips)
+            self.assertTrue(all(clip.closed for clip in opened_clips))
+            self.assertFalse(Path(temp_clip).exists())
+
+    def test_generate_video_write_failure_closes_resources_and_removes_partial(self):
+        class _FakeClip:
+            def __init__(self, fps=None):
+                self.fps = fps
+                self.closed = False
+
+            def with_effects(self, effects):
+                return self
+
+            def with_audio(self, audio):
+                return self
+
+            def close(self):
+                self.closed = True
+
+        video_clip = _FakeClip()
+        audio_clip = _FakeClip(fps=48000)
+        params = types.SimpleNamespace(
+            video_aspect="9:16",
+            subtitle_enabled=True,
+            font_name="test.ttf",
+            bgm_type="none",
+            bgm_file="",
+            voice_volume=1.0,
+            n_threads=1,
+        )
+
+        def fail_write(clip, output_file, codec, **kwargs):
+            Path(output_file).write_bytes(b"incomplete-video")
+            raise RuntimeError("render failed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "final.mp4")
+            with patch.object(vd, "_open_video_clip_quietly", return_value=video_clip):
+                with patch.object(vd, "AudioFileClip", return_value=audio_clip):
+                    with patch.object(
+                        vd,
+                        "_write_videofile_with_codec_fallback",
+                        side_effect=fail_write,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "render failed"):
+                            vd.generate_video(
+                                video_path="combined.mp4",
+                                audio_path="audio.mp3",
+                                subtitle_path="",
+                                output_file=output_file,
+                                params=params,
+                            )
+
+            self.assertTrue(video_clip.closed)
+            self.assertTrue(audio_clip.closed)
+            self.assertFalse(Path(output_file).exists())
+            self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
 
     def test_combine_videos_handles_none_transition_mode(self):
         """
@@ -636,6 +800,7 @@ class TestVideoService(unittest.TestCase):
 
     def test_concat_video_clips_limits_output_to_audio_duration(self):
         def fake_run(command, capture_output, text, check):
+            Path(command[-1]).write_bytes(b"combined-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         config.app["video_codec"] = "libx264"
@@ -655,10 +820,13 @@ class TestVideoService(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-t") + 1], "10.000")
-        self.assertLess(command.index("-t"), command.index(output_file))
+        self.assertLess(command.index("-t"), len(command) - 1)
+        self.assertEqual(Path(command[-1]).parent, Path(output_file).parent)
+        self.assertRegex(Path(command[-1]).name, r"^combined\.[0-9a-f]{32}\.partial\.mp4$")
 
     def test_concat_video_clips_attempts_stream_copy_first(self):
         def fake_run(command, capture_output, text, check):
+            Path(command[-1]).write_bytes(b"combined-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -680,9 +848,7 @@ class TestVideoService(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertEqual(command[command.index("-c:v") + 1], "copy")
             self.assertEqual(command[command.index("-t") + 1], "2.500")
-            self.assertFalse(
-                os.path.exists(os.path.join(temp_dir, "ffmpeg-concat-list.txt"))
-            )
+            self.assertEqual(list(Path(temp_dir).glob("ffmpeg-concat-list-*.txt")), [])
 
     def test_concat_video_clips_reencodes_when_stream_copy_raises(self):
         config.app["video_codec"] = "libx264"
@@ -691,6 +857,7 @@ class TestVideoService(unittest.TestCase):
             codec = command[command.index("-c:v") + 1]
             if codec == "copy":
                 raise OSError("stream copy could not start")
+            Path(command[-1]).write_bytes(b"combined-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -713,9 +880,7 @@ class TestVideoService(unittest.TestCase):
             ]
             self.assertEqual(used_codec, "libx264")
             self.assertEqual(used_codecs, ["copy", "libx264"])
-            self.assertFalse(
-                os.path.exists(os.path.join(temp_dir, "ffmpeg-concat-list.txt"))
-            )
+            self.assertEqual(list(Path(temp_dir).glob("ffmpeg-concat-list-*.txt")), [])
 
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """

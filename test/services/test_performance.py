@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import closing
@@ -464,6 +465,91 @@ class TelemetryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM resource_samples").fetchone()[0]
         self.assertEqual(count, 2)
+
+    def test_locked_database_does_not_change_instrumented_result(self):
+        called = []
+
+        @self.telemetry.task_decorator("locked")
+        def work():
+            called.append(True)
+            return "result"
+
+        with closing(sqlite3.connect(self.db, timeout=0)) as lock:
+            lock.execute("PRAGMA journal_mode=DELETE")
+            lock.execute("BEGIN EXCLUSIVE")
+            self.assertEqual(work(), "result")
+
+        self.assertEqual(called, [True])
+
+    def test_start_failure_does_not_prevent_callable(self):
+        called = []
+
+        @self.telemetry.task_decorator("start-failure")
+        def work():
+            called.append(True)
+            return 42
+
+        with patch.object(
+            self.telemetry, "_start_run", side_effect=sqlite3.OperationalError("locked")
+        ):
+            self.assertEqual(work(), 42)
+
+        self.assertEqual(called, [True])
+
+    def test_finish_failure_preserves_original_exception(self):
+        original = ValueError("callable failed")
+
+        @self.telemetry.task_decorator("finish-failure")
+        def work():
+            raise original
+
+        with patch.object(
+            self.telemetry, "_finish_run", side_effect=OSError("disk unavailable")
+        ):
+            with self.assertRaises(ValueError) as raised:
+                work()
+
+        self.assertIs(raised.exception, original)
+
+    def test_initialization_and_sampling_database_errors_are_safe(self):
+        with patch.object(
+            performance.PerformanceTelemetry,
+            "_initialize",
+            side_effect=sqlite3.OperationalError("locked"),
+        ):
+            telemetry = performance.PerformanceTelemetry(self.db)
+
+        with patch.object(
+            telemetry, "_connect", side_effect=OSError("disk unavailable")
+        ):
+            telemetry.sample_resources()
+
+        with patch.object(
+            performance, "_storage_dir", side_effect=OSError("storage unavailable")
+        ), patch.object(performance.PerformanceTelemetry, "_initialize"):
+            fallback = performance.PerformanceTelemetry()
+        self.assertEqual(fallback.db_path, Path(performance.os.devnull))
+
+    def test_initialization_prunes_completed_telemetry_older_than_thirty_days(self):
+        old = time.time() - 31 * 24 * 60 * 60
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("old", "old", old, old, 1.0, "ok", "{}", None),
+            )
+            connection.execute(
+                "INSERT INTO resource_samples (task_id, sampled_at) VALUES (?, ?)",
+                ("old", old),
+            )
+
+        performance.PerformanceTelemetry(self.db)
+
+        with closing(sqlite3.connect(self.db)) as connection:
+            tasks = connection.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+            samples = connection.execute(
+                "SELECT COUNT(*) FROM resource_samples"
+            ).fetchone()[0]
+        self.assertEqual((tasks, samples), (0, 0))
 
 
 if __name__ == "__main__":

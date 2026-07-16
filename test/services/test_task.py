@@ -27,6 +27,39 @@ class TestTaskService(unittest.TestCase):
     def tearDown(self):
         pass
 
+    def test_start_marks_failed_and_reraises_unhandled_exception(self):
+        params = VideoParams(video_subject="Coffee")
+
+        with (
+            patch.object(tm.performance, "get_runtime_profile") as profile,
+            patch.object(tm.sm.state, "update_task") as update_task,
+        ):
+            profile.return_value.disk_critical = True
+            profile.return_value.ffmpeg_threads = 1
+            with self.assertRaisesRegex(RuntimeError, "Insufficient free disk space"):
+                tm.start("task-id", params)
+
+        update_task.assert_called_once_with(
+            "task-id", state=tm.const.TASK_STATE_FAILED
+        )
+
+    def test_start_preserves_successful_return(self):
+        params = VideoParams(video_subject="Coffee", video_script="Ready script")
+
+        with (
+            patch.object(tm.performance, "get_runtime_profile") as profile,
+            patch.object(tm.sm.state, "update_task") as update_task,
+        ):
+            profile.return_value.disk_critical = False
+            profile.return_value.ffmpeg_threads = 1
+            result = tm.start("task-id", params, stop_at="script")
+
+        self.assertEqual(result, {"script": "Ready script"})
+        self.assertNotEqual(
+            update_task.call_args_list[-1].kwargs["state"],
+            tm.const.TASK_STATE_FAILED,
+        )
+
     def test_generate_script_forwards_advanced_prompt_options(self):
         """
         任务生成入口和 WebUI/API 共用 VideoParams。这里验证自动生成文案时，
@@ -142,6 +175,12 @@ class TestTaskService(unittest.TestCase):
                 with (
                     patch.object(tm.voice, "tts") as tts,
                     patch.object(tm.voice, "get_audio_duration", return_value=6),
+                    patch.dict(
+                        tm.config.app,
+                        {"custom_audio_allowed_dirs": [
+                            os.path.dirname(server_audio.name)
+                        ]},
+                    ),
                 ):
                     audio_file, audio_duration, result_sub_maker = tm.generate_audio(
                         task_id, params, "script"
@@ -153,6 +192,18 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(audio_duration, 6)
         self.assertIsNone(result_sub_maker)
         tts.assert_not_called()
+
+    def test_resolve_custom_audio_rejects_unapproved_absolute_file(self):
+        task_id = "test-custom-audio-unapproved"
+        task_dir = utils.task_dir(task_id)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio, patch.dict(
+                tm.config.app, {"custom_audio_allowed_dirs": []}
+            ):
+                with self.assertRaisesRegex(ValueError, "approved directory"):
+                    tm.resolve_custom_audio_file(task_id, server_audio.name)
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
 
     def test_generate_audio_rejects_missing_custom_file_without_tts(self):
         task_id = "test-custom-audio-missing"

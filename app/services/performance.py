@@ -15,6 +15,7 @@ import functools
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import platform
@@ -48,6 +49,30 @@ _SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|authorization|password|secret|token)\s*[=:]\s*[^\s,;]+"
 )
 _PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s,;]+")
+_TELEMETRY_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_TELEMETRY_WARNING_INTERVAL = 60.0
+_telemetry_logger = logging.getLogger(__name__)
+_telemetry_warning_lock = threading.Lock()
+_telemetry_warning_times: dict[str, float] = {}
+
+
+def _log_telemetry_error(operation: str, error: BaseException) -> None:
+    """Report telemetry failures without making logging part of the failure path."""
+
+    now = time.monotonic()
+    with _telemetry_warning_lock:
+        previous = _telemetry_warning_times.get(operation, 0.0)
+        if now - previous < _TELEMETRY_WARNING_INTERVAL:
+            return
+        _telemetry_warning_times[operation] = now
+    try:
+        _telemetry_logger.warning(
+            "Performance telemetry %s failed: %s",
+            operation,
+            redact_error(error),
+        )
+    except Exception:
+        pass
 
 
 def _storage_dir() -> str:
@@ -1255,14 +1280,22 @@ class _RunContext(ContextDecorator):
         if self.kind == "task":
             task_id = self.run_id
             self.token = _task_id.set(task_id)
-        self.telemetry._start_run(self.kind, self.run_id, task_id, self.name, self.started, self.context)
+        try:
+            self.telemetry._start_run(
+                self.kind, self.run_id, task_id, self.name, self.started, self.context
+            )
+        except (sqlite3.Error, OSError) as error:
+            _log_telemetry_error("run start", error)
         return self
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, traceback: Any) -> bool:
         try:
-            self.telemetry._finish_run(
-                self.kind, self.run_id, time.time(), exc or self.failure
-            )
+            try:
+                self.telemetry._finish_run(
+                    self.kind, self.run_id, time.time(), exc or self.failure
+                )
+            except (sqlite3.Error, OSError) as error:
+                _log_telemetry_error("run finish", error)
         finally:
             if self.token is not None:
                 _task_id.reset(self.token)
@@ -1296,14 +1329,21 @@ class ResourceSampler:
     def start(self) -> "ResourceSampler":
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, daemon=True, name="resource-sampler")
-            self._thread.start()
+            try:
+                self._thread.start()
+            except OSError as error:
+                self._thread = None
+                _log_telemetry_error("sampler start", error)
         return self
 
     def _run(self) -> None:
         for _ in range(self.max_samples):
             if self._stop.is_set():
                 break
-            self.telemetry.sample_resources(task_id=self.task_id)
+            try:
+                self.telemetry.sample_resources(task_id=self.task_id)
+            except (sqlite3.Error, OSError) as error:
+                _log_telemetry_error("resource sampling", error)
             if self._stop.wait(self.interval):
                 break
 
@@ -1324,8 +1364,16 @@ class PerformanceTelemetry:
     """SQLite-backed task, stage, and bounded process-resource telemetry."""
 
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
-        self.db_path = Path(db_path or Path(_storage_dir()) / "performance.db").resolve()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path = db_path or Path(_storage_dir()) / "performance.db"
+            self.db_path = Path(path).resolve()
+        except OSError as error:
+            self.db_path = Path(os.devnull)
+            _log_telemetry_error("path initialization", error)
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            _log_telemetry_error("directory initialization", error)
         self._process = None
         if _psutil is not None:
             try:
@@ -1334,10 +1382,13 @@ class PerformanceTelemetry:
                 _psutil.cpu_percent(interval=None)
             except Exception:
                 self._process = None
-        self._initialize()
+        try:
+            self._initialize()
+        except (sqlite3.Error, OSError) as error:
+            _log_telemetry_error("database initialization", error)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0)
+        connection = sqlite3.connect(self.db_path, timeout=0.25)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -1378,6 +1429,18 @@ class PerformanceTelemetry:
                     connection.execute(
                         f"ALTER TABLE resource_samples ADD COLUMN {name} {sql_type}"
                     )
+            cutoff = time.time() - _TELEMETRY_RETENTION_SECONDS
+            connection.execute(
+                "DELETE FROM resource_samples WHERE sampled_at < ?", (cutoff,)
+            )
+            connection.execute(
+                "DELETE FROM stage_runs WHERE finished_at IS NOT NULL AND finished_at < ?",
+                (cutoff,),
+            )
+            connection.execute(
+                "DELETE FROM task_runs WHERE finished_at IS NOT NULL AND finished_at < ?",
+                (cutoff,),
+            )
 
     @staticmethod
     def _context_json(context: Mapping[str, Any]) -> str:
@@ -1471,19 +1534,22 @@ class PerformanceTelemetry:
         ]
         if temperatures:
             gpu_temperature = max(temperatures)
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                "INSERT INTO resource_samples "
-                "(task_id, sampled_at, cpu_percent, rss_bytes, ram_available, "
-                "gpu_percent, gpu_memory_used, system_cpu_percent, "
-                "cpu_frequency_mhz, gpu_temperature_c) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    task_id or _task_id.get(), time.time(), cpu, rss, available,
-                    gpu_percent, gpu_memory, system_cpu, cpu_frequency,
-                    gpu_temperature,
-                ),
-            )
+        try:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "INSERT INTO resource_samples "
+                    "(task_id, sampled_at, cpu_percent, rss_bytes, ram_available, "
+                    "gpu_percent, gpu_memory_used, system_cpu_percent, "
+                    "cpu_frequency_mhz, gpu_temperature_c) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        task_id or _task_id.get(), time.time(), cpu, rss, available,
+                        gpu_percent, gpu_memory, system_cpu, cpu_frequency,
+                        gpu_temperature,
+                    ),
+                )
+        except (sqlite3.Error, OSError) as error:
+            _log_telemetry_error("resource sampling", error)
 
     def sampler(self, interval: float = 1.0, max_samples: int = 3600) -> ResourceSampler:
         """Create a sampler that stops explicitly or after ``max_samples``."""

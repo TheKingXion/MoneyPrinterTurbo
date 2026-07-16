@@ -34,7 +34,7 @@ from app.services import bgm as bgm_service
 from app.services import performance
 from app.services import state as sm
 from app.services import task as tm
-from app.utils import file_security, utils
+from app.utils import file_security, upload as upload_utils, utils
 
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
@@ -81,6 +81,18 @@ def _sanitize_upload_filename(filename: str, request_id: str) -> str:
             message=f"{request_id}: invalid filename",
         )
     return normalized_name
+
+
+def _upload_limit_bytes(config_key: str, default_mb: int) -> int:
+    try:
+        configured_mb = int(config.app.get(config_key, default_mb))
+    except (TypeError, ValueError):
+        configured_mb = default_mb
+    return max(1, configured_mb) * 1024 * 1024
+
+
+def _validate_video_material(file_path: str) -> None:
+    upload_utils.validate_visual_media(file_path)
 
 
 def _resolve_path_within_directory(base_dir: str, unsafe_path: str, request_id: str) -> str:
@@ -209,11 +221,16 @@ def create_task(
             "params": body.model_dump(),
         }
         sm.state.update_task(task_id)
-        task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at=stop_at)
+        try:
+            task_manager.add_task(
+                tm.start, task_id=task_id, params=body, stop_at=stop_at
+            )
+        except Exception:
+            sm.state.delete_task(task_id)
+            raise
         logger.success(f"Task created: {utils.to_json(task)}")
         return utils.get_response(200, task)
     except TaskQueueFullError as e:
-        sm.state.delete_task(task_id)
         logger.warning(
             f"reject task because queue is full, request_id: {request_id}, task_id: {task_id}"
         )
@@ -395,13 +412,34 @@ def upload_video_material_file(request: Request, file: UploadFile = File(...)):
     # 统一按小写扩展名校验，兼容 .MOV 这类大写后缀文件。
     if normalized_filename in {f".{suffix}" for suffix in allowed_suffixes}:
         local_videos_dir = utils.storage_dir("local_videos", create=True)
-        save_path = os.path.join(local_videos_dir, safe_filename)
-        # save file
-        with open(save_path, "wb+") as buffer:
-            # If the file already exists, it will be overwritten
+        try:
             file.file.seek(0)
-            buffer.write(file.file.read())
-        response = {"file": safe_filename}
+            stored_name, _ = upload_utils.save_upload_atomically(
+                file.file,
+                local_videos_dir,
+                normalized_filename,
+                max_file_bytes=_upload_limit_bytes(
+                    "video_material_upload_max_file_mb", 512
+                ),
+                max_total_bytes=_upload_limit_bytes(
+                    "video_material_upload_max_total_mb", 10 * 1024
+                ),
+                validate=_validate_video_material,
+            )
+        except upload_utils.UploadRejectedError as exc:
+            raise HttpException(
+                request_id, status_code=400, message=f"{request_id}: {str(exc)}"
+            ) from exc
+        except upload_utils.UploadStorageError as exc:
+            logger.error(
+                f"video material upload failed: request_id={request_id}, error={str(exc)}"
+            )
+            raise HttpException(
+                request_id,
+                status_code=500,
+                message=f"{request_id}: video material validation is unavailable",
+            ) from exc
+        response = {"file": stored_name}
         return utils.get_response(200, response)
 
     raise HttpException(

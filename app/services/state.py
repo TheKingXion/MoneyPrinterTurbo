@@ -77,6 +77,8 @@ class RedisState(BaseState):
     schema-based format.
     """
 
+    TASK_KEY_PREFIX = "mpt:task:"
+
     def __init__(self, host="localhost", port=6379, db=0, password=None):
         import redis
 
@@ -89,7 +91,9 @@ class RedisState(BaseState):
         cursor = 0
         total = 0
         while True:
-            cursor, keys = self._redis.scan(cursor, count=page_size)
+            cursor, keys = self._redis.scan(
+                cursor, match=f"{self.TASK_KEY_PREFIX}*", count=page_size
+            )
             batch_start = total
             batch_size = len(keys)
             total += batch_size
@@ -132,11 +136,15 @@ class RedisState(BaseState):
             **kwargs,
         }
 
-        for field, value in fields.items():
-            self._redis.hset(task_id, field, str(value))
+        self._redis.hset(
+            self._task_key(task_id),
+            mapping={field: str(value) for field, value in fields.items()},
+        )
 
     def get_task(self, task_id: str):
-        task_data = self._redis.hgetall(task_id)
+        task_data = self._redis.hgetall(self._task_key(task_id))
+        if not task_data:
+            task_data = self._redis.hgetall(task_id)
         if not task_data:
             return None
 
@@ -147,7 +155,11 @@ class RedisState(BaseState):
         return task
 
     def delete_task(self, task_id: str):
-        self._redis.delete(task_id)
+        self._redis.delete(self._task_key(task_id), task_id)
+
+    @classmethod
+    def _task_key(cls, task_id: str) -> str:
+        return f"{cls.TASK_KEY_PREFIX}{task_id}"
 
     @staticmethod
     def _convert_to_original_type(value):

@@ -15,6 +15,13 @@ class TaskManager:
         self.current_tasks = 0
         self.lock = threading.Lock()
         self.queue = self.create_queue()
+        self.initialize_queue()
+
+    def initialize_queue(self):
+        pass
+
+    def recover_abandoned_tasks(self):
+        pass
 
     def create_queue(self):
         raise NotImplementedError()
@@ -48,13 +55,19 @@ class TaskManager:
                 )
                 self.enqueue({"func": func, "args": args, "kwargs": kwargs})
 
-    def execute_task(self, func: Callable, *args: Any, **kwargs: Any):
+    def execute_task(
+        self, func: Callable, *args: Any, _task_receipt=None, **kwargs: Any
+    ):
+        if _task_receipt is not None:
+            kwargs = {**kwargs, "_task_receipt": _task_receipt}
         thread = threading.Thread(
             target=self.run_task, args=(func, *args), kwargs=kwargs
         )
         thread.start()
 
-    def run_task(self, func: Callable, *args: Any, **kwargs: Any):
+    def run_task(
+        self, func: Callable, *args: Any, _task_receipt=None, **kwargs: Any
+    ):
         try:
             func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
         except Exception:
@@ -62,7 +75,10 @@ class TaskManager:
             logger.exception(f"task failed: {function_name}")
             raise
         finally:
-            self.task_done()
+            if _task_receipt is None:
+                self.task_done()
+            else:
+                self.task_done(_task_receipt)
 
     def check_queue(self):
         with self.lock:
@@ -74,21 +90,56 @@ class TaskManager:
                 func = task_info["func"]
                 args = task_info.get("args", ())
                 kwargs = task_info.get("kwargs", {})
+                receipt = self.task_receipt(task_info)
                 self.current_tasks += 1
                 try:
-                    self.execute_task(func, *args, **kwargs)
+                    if receipt is None:
+                        self.execute_task(func, *args, **kwargs)
+                    else:
+                        self.execute_task(
+                            func, *args, _task_receipt=receipt, **kwargs
+                        )
                 except Exception:
                     self.current_tasks -= 1
                     # Starting a worker can fail transiently (thread limits,
                     # interpreter shutdown). Preserve the dequeued task so a
                     # later queue check can retry it instead of losing work.
-                    self.enqueue(task_info)
+                    self.requeue(task_info)
                     raise
 
-    def task_done(self):
-        with self.lock:
-            self.current_tasks -= 1
+    def task_receipt(self, task: Dict):
+        return None
+
+    def acknowledge(self, receipt):
+        pass
+
+    def requeue(self, task: Dict):
+        self.enqueue(task)
+
+    def task_done(self, receipt=None):
+        try:
+            if receipt is not None:
+                try:
+                    self.acknowledge(receipt)
+                except Exception:
+                    logger.exception("failed to acknowledge completed queued task")
+        finally:
+            with self.lock:
+                self.current_tasks -= 1
         self.check_queue()
+
+    def resume_queued_tasks(self):
+        """Fill available local worker slots from a queue left by a restart."""
+        self.recover_abandoned_tasks()
+        while True:
+            with self.lock:
+                can_start = (
+                    self.current_tasks < self.max_concurrent_tasks
+                    and not self.is_queue_empty()
+                )
+            if not can_start:
+                return
+            self.check_queue()
 
     def enqueue(self, task: Dict):
         raise NotImplementedError()

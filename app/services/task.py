@@ -3,6 +3,7 @@ import os.path
 import re
 import time
 from datetime import datetime, timezone
+from functools import wraps
 from os import path
 
 from loguru import logger
@@ -13,10 +14,26 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import llm, material, performance, sonilo, subtitle, twelvelabs, video, voice, upload_post
 from app.services import state as sm
+from app.services.task_manifest import TaskManifest, hash_file
 from app.services.youtube_uploader import upload_tracker, youtube_uploader
 from app.services.tiktok_scheduler import tiktok_scheduler
 from app.services.tiktok_uploader import tiktok_upload_tracker, tiktok_uploader
 from app.utils import file_security, utils
+
+
+def _mark_failed_on_unhandled_exception(func):
+    @wraps(func)
+    def wrapped(task_id, *args, **kwargs):
+        try:
+            return func(task_id, *args, **kwargs)
+        except Exception:
+            try:
+                sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            except Exception:
+                logger.exception(f"failed to mark task as failed: {task_id}")
+            raise
+
+    return wrapped
 
 
 @performance.instrument_stage("script")
@@ -110,6 +127,76 @@ def save_script_data(task_id, video_script, video_terms, params):
         f.write(utils.to_json(script_data))
 
 
+def _script_terms_cache_inputs(params, selected_sources):
+    provider_id = str(config.app.get("llm_provider", "")).strip().lower()
+    provider = llm.get_llm_provider(provider_id)
+    model_name = (
+        provider.resolve_model_name(
+            config.app.get(provider.config_key("model_name"), "")
+        )
+        if provider
+        else ""
+    )
+    return {
+        "video_subject": params.video_subject,
+        "video_script": params.video_script,
+        "video_terms": params.video_terms,
+        "video_language": params.video_language,
+        "paragraph_number": params.paragraph_number,
+        "video_script_prompt": params.video_script_prompt,
+        "custom_system_prompt": params.custom_system_prompt,
+        "match_materials_to_script": params.match_materials_to_script,
+        "uses_local_materials": "local" in selected_sources,
+        "llm_provider": provider_id,
+        "llm_model": model_name,
+        "twelvelabs_rerank_terms": bool(
+            config.app.get("twelvelabs_rerank_terms")
+        ),
+        "twelvelabs_marengo_model": config.app.get(
+            "twelvelabs_marengo_model", twelvelabs.DEFAULT_MARENGO_MODEL
+        ),
+    }
+
+
+def _audio_cache_inputs(params, video_script):
+    return {
+        "video_script": video_script,
+        "voice_name": params.voice_name,
+        "voice_rate": params.voice_rate,
+    }
+
+
+def _subtitle_cache_inputs(params, video_script, audio_file):
+    provider = str(config.app.get("subtitle_provider", "edge")).strip().lower()
+    return {
+        "video_script": video_script,
+        "audio_sha256": hash_file(audio_file),
+        "subtitle_enabled": params.subtitle_enabled,
+        "subtitle_provider": provider,
+        "whisper_model_size": config.whisper.get("model_size", "large-v3")
+        if provider == "whisper" else None,
+        "whisper_device": config.whisper.get("device", "cpu")
+        if provider == "whisper" else None,
+        "whisper_compute_type": config.whisper.get("compute_type", "int8")
+        if provider == "whisper" else None,
+    }
+
+
+def _restore_cached_stage(manifest, stage, inputs):
+    try:
+        return manifest.restore(stage, inputs)
+    except Exception as exc:
+        logger.warning(f"failed to read task cache stage {stage}: {exc}")
+        return None
+
+
+def _complete_cached_stage(manifest, stage, inputs, outputs, artifacts):
+    try:
+        manifest.complete(stage, inputs, outputs, artifacts)
+    except Exception as exc:
+        logger.warning(f"failed to persist task cache stage {stage}: {exc}")
+
+
 @performance.instrument_stage("social_metadata")
 def save_social_metadata(task_id, params, video_script):
     """Create ready-to-publish TikTok and YouTube Shorts metadata per video task."""
@@ -164,38 +251,33 @@ def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> st
     if not requested_file:
         return ""
 
-    task_dir = utils.task_dir(task_id)
-    try:
-        return file_security.resolve_path_within_directory(
-            task_dir,
-            requested_file,
-        )
-    except ValueError as exc:
-        task_dir_error = exc
+    allowed_directories = [utils.task_dir(task_id)]
+    configured_directories = config.app.get("custom_audio_allowed_dirs", [])
+    if isinstance(configured_directories, str):
+        configured_directories = [
+            item.strip() for item in configured_directories.split(",") if item.strip()
+        ]
+    if isinstance(configured_directories, (list, tuple)):
+        for directory in configured_directories:
+            if not isinstance(directory, str) or not directory.strip():
+                continue
+            allowed_directories.append(
+                directory
+                if path.isabs(directory)
+                else path.join(utils.root_dir(), directory)
+            )
 
-    server_audio_file = path.realpath(
-        requested_file
-        if path.isabs(requested_file)
-        else path.join(utils.root_dir(), requested_file)
-    )
-    if not path.isabs(requested_file):
-        project_root = path.realpath(utils.root_dir())
+    last_error = ValueError("custom audio file does not exist")
+    for directory in allowed_directories:
         try:
-            if path.commonpath([project_root, server_audio_file]) != project_root:
-                raise ValueError(
-                    "relative custom audio paths must stay within the project directory"
-                )
+            return file_security.resolve_path_within_directory(
+                directory, requested_file
+            )
         except ValueError as exc:
-            raise ValueError(
-                "custom audio file must be task-local or an existing server-side file"
-            ) from exc
-
-    if not path.isfile(server_audio_file):
-        raise ValueError(
-            "custom audio file does not exist or is not a file"
-        ) from task_dir_error
-
-    return server_audio_file
+            last_error = exc
+    raise ValueError(
+        "custom audio file must be inside the task directory or an approved directory"
+    ) from last_error
 
 
 @performance.instrument_stage("audio")
@@ -455,6 +537,7 @@ def generate_final_videos(
         )
 
 
+@_mark_failed_on_unhandled_exception
 @performance.instrument_task("video_generation")
 def start(
     task_id,
@@ -470,6 +553,7 @@ def start(
         raise RuntimeError("Insufficient free disk space for safe video generation")
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+    task_manifest = TaskManifest(task_id, utils.task_dir(task_id))
 
     if (
         stop_at == "video"
@@ -481,13 +565,52 @@ def start(
         logger.error("Sonilo background music requires an API key")
         return
 
+    selected_sources = getattr(params, "video_sources", None) or [params.video_source]
+    script_terms_inputs = _script_terms_cache_inputs(params, selected_sources)
+    cached_script_terms = _restore_cached_stage(
+        task_manifest, "script_terms", script_terms_inputs
+    )
+    if cached_script_terms:
+        cached_outputs = cached_script_terms["outputs"]
+        if not isinstance(cached_outputs.get("script"), str) or not isinstance(
+            cached_outputs.get("terms"), (str, list)
+        ):
+            cached_script_terms = None
+    cached_script = None
+    if not cached_script_terms:
+        cached_script = _restore_cached_stage(
+            task_manifest, "script", script_terms_inputs
+        )
+        if cached_script and not isinstance(cached_script["outputs"].get("script"), str):
+            cached_script = None
+
     # 1. Generate script
-    video_script = generate_script(task_id, params)
+    if cached_script_terms:
+        video_script = cached_script_terms["outputs"]["script"]
+        video_terms = cached_script_terms["outputs"]["terms"]
+        logger.info(f"reusing cached script and terms: task_id={task_id}")
+    elif cached_script:
+        video_script = cached_script["outputs"]["script"]
+        video_terms = ""
+        logger.info(f"reusing cached script: task_id={task_id}")
+    else:
+        video_script = generate_script(task_id, params)
+        video_terms = ""
     if not video_script or "Error: " in video_script:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+
+    if not cached_script_terms and not cached_script:
+        save_script_data(task_id, video_script, "", params)
+        _complete_cached_stage(
+            task_manifest,
+            "script",
+            script_terms_inputs,
+            {"script": video_script},
+            {},
+        )
 
     if stop_at == "script":
         sm.state.update_task(
@@ -496,15 +619,21 @@ def start(
         return {"script": video_script}
 
     # 2. Generate terms
-    video_terms = ""
-    selected_sources = getattr(params, "video_sources", None) or [params.video_source]
-    if "local" not in selected_sources:
+    if not cached_script_terms and "local" not in selected_sources:
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             return
 
-    save_script_data(task_id, video_script, video_terms, params)
+    if not cached_script_terms:
+        save_script_data(task_id, video_script, video_terms, params)
+        _complete_cached_stage(
+            task_manifest,
+            "script_terms",
+            script_terms_inputs,
+            {"script": video_script, "terms": video_terms},
+            {"script_data": path.join(utils.task_dir(task_id), "script.json")},
+        )
 
     if stop_at == "terms":
         sm.state.update_task(
@@ -515,12 +644,36 @@ def start(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
     # 3. Generate audio
-    audio_file, audio_duration, sub_maker = generate_audio(
-        task_id, params, video_script
-    )
+    audio_inputs = _audio_cache_inputs(params, video_script)
+    cached_audio = None
+    if not getattr(params, "custom_audio_file", None):
+        cached_audio = _restore_cached_stage(task_manifest, "audio", audio_inputs)
+    if cached_audio and (
+        "audio" not in cached_audio["artifacts"]
+        or not isinstance(cached_audio["outputs"].get("duration"), (int, float))
+    ):
+        cached_audio = None
+    if cached_audio:
+        audio_file = cached_audio["artifacts"]["audio"]
+        audio_duration = cached_audio["outputs"]["duration"]
+        sub_maker = None
+        logger.info(f"reusing cached audio: task_id={task_id}")
+    else:
+        audio_file, audio_duration, sub_maker = generate_audio(
+            task_id, params, video_script
+        )
     if not audio_file:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
+
+    if not cached_audio and not getattr(params, "custom_audio_file", None):
+        _complete_cached_stage(
+            task_manifest,
+            "audio",
+            audio_inputs,
+            {"duration": audio_duration},
+            {"audio": audio_file},
+        )
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
@@ -534,9 +687,41 @@ def start(
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
-    subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
+    subtitle_inputs = _subtitle_cache_inputs(params, video_script, audio_file)
+    cached_subtitle = _restore_cached_stage(
+        task_manifest, "subtitle", subtitle_inputs
     )
+    if cached_subtitle:
+        subtitle_path = cached_subtitle["artifacts"].get("subtitle", "")
+        logger.info(f"reusing cached subtitle: task_id={task_id}")
+    else:
+        subtitle_provider = subtitle_inputs["subtitle_provider"]
+        if cached_audio and params.subtitle_enabled and subtitle_provider != "whisper":
+            audio_file, audio_duration, sub_maker = generate_audio(
+                task_id, params, video_script
+            )
+            if not audio_file:
+                sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+                return
+            _complete_cached_stage(
+                task_manifest,
+                "audio",
+                audio_inputs,
+                {"duration": audio_duration},
+                {"audio": audio_file},
+            )
+            subtitle_inputs = _subtitle_cache_inputs(params, video_script, audio_file)
+        subtitle_path = generate_subtitle(
+            task_id, params, video_script, sub_maker, audio_file
+        )
+        subtitle_artifacts = {"subtitle": subtitle_path} if subtitle_path else {}
+        _complete_cached_stage(
+            task_manifest,
+            "subtitle",
+            subtitle_inputs,
+            {"enabled": bool(params.subtitle_enabled)},
+            subtitle_artifacts,
+        )
 
     if stop_at == "subtitle":
         sm.state.update_task(
@@ -668,10 +853,25 @@ def start(
                     ):
                         tiktok_upload_results.append({"success": True, "skipped": True, "reason": "already claimed"})
                         continue
+
+                    def persist_publish_id(
+                        publish_id, upload_index=i + 1, upload_path=video_path
+                    ):
+                        tiktok_upload_tracker.add_entry(
+                            task_id=task_id,
+                            index=upload_index,
+                            subject=params.video_subject,
+                            video_path=upload_path,
+                            status="uploading",
+                            provider=tiktok_uploader.provider,
+                            publish_id=publish_id,
+                        )
+
                     result = tiktok_uploader.upload_video(
                         video_path=video_path,
                         caption=caption,
                         idempotency_key=f"{task_id}-{i + 1}",
+                        on_publish_id=persist_publish_id,
                     )
                     status = (
                         result.get("status", "processing")

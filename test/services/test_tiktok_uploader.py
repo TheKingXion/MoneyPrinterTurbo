@@ -185,7 +185,7 @@ class TestTikTokOAuth(unittest.TestCase):
 
     @patch("app.services.tiktok_uploader.requests.put")
     @patch("app.services.tiktok_uploader.requests.post")
-    def test_trailing_bytes_are_merged_into_final_chunk(self, mock_post, mock_put):
+    def test_official_file_upload_chunks_cover_exact_file_size(self, mock_post, mock_put):
         uploader = TikTokUploader()
         uploader.sync_from_config = MagicMock()
         uploader.enabled = True
@@ -201,17 +201,54 @@ class TestTikTokOAuth(unittest.TestCase):
         }
         mock_post.return_value = response
         mock_put.return_value = MagicMock()
-        size = 10 * 1024 * 1024 + 1
+        chunk_size = 10 * 1024 * 1024
+        for size in (1, chunk_size, chunk_size + 1, 25 * 1024 * 1024):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                mock_post.reset_mock()
+                mock_put.reset_mock()
+                video = Path(directory) / "video.mp4"
+                with video.open("wb") as file:
+                    file.seek(size - 1)
+                    file.write(b"x")
+                result = uploader.upload_video(str(video), "Caption")
+
+                source_info = mock_post.call_args.kwargs["json"]["source_info"]
+                chunks = [call.kwargs["data"] for call in mock_put.call_args_list]
+                self.assertTrue(result["success"])
+                self.assertEqual(source_info["total_chunk_count"], (size + chunk_size - 1) // chunk_size)
+                self.assertTrue(all(chunks))
+                self.assertEqual(sum(map(len, chunks)), size)
+                self.assertEqual(len(chunks), source_info["total_chunk_count"])
+
+    @patch("app.services.tiktok_uploader.requests.put")
+    @patch("app.services.tiktok_uploader.requests.post")
+    def test_publish_id_callback_runs_before_upload(self, mock_post, mock_put):
+        uploader = TikTokUploader()
+        uploader.sync_from_config = MagicMock()
+        uploader.enabled = True
+        uploader.provider = "official"
+        uploader.privacy_level = "SELF_ONLY"
+        uploader.remaining_upload_slots = MagicMock(return_value=5)
+        uploader.creator_info = MagicMock(return_value={"privacy_level_options": ["SELF_ONLY"]})
+        uploader._access_token = MagicMock(return_value="token")
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {"upload_url": "https://upload.example/video", "publish_id": "pub-callback"},
+            "error": {"code": "ok"},
+        }
+        mock_post.return_value = response
+        events = []
+        mock_put.side_effect = lambda *args, **kwargs: events.append("upload") or MagicMock()
+
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "video.mp4"
-            with video.open("wb") as file:
-                file.seek(size - 1)
-                file.write(b"x")
-            result = uploader.upload_video(str(video), "Caption")
-        source_info = mock_post.call_args.kwargs["json"]["source_info"]
+            video.write_bytes(b"x")
+            result = uploader.upload_video(
+                str(video), "Caption", on_publish_id=lambda publish_id: events.append(publish_id)
+            )
+
         self.assertTrue(result["success"])
-        self.assertEqual(source_info["total_chunk_count"], 1)
-        self.assertEqual(mock_put.call_args.kwargs["headers"]["Content-Length"], str(size))
+        self.assertEqual(events, ["pub-callback", "upload"])
 
     def test_upload_post_completed_failure_is_not_published(self):
         result = TikTokUploader._normalize_upload_post_status(
@@ -309,6 +346,39 @@ class TestTikTokScheduler(unittest.TestCase):
         self.assertEqual(saved["status"], "pending")
         statuses = [call.args[4] for call in tracker.add_entry.call_args_list]
         self.assertIn("scheduled_retry", statuses)
+
+    @patch("app.services.tiktok_scheduler.tiktok_uploader")
+    @patch("app.services.tiktok_scheduler.tiktok_upload_tracker")
+    def test_publish_id_is_persisted_during_scheduled_upload(self, tracker, uploader):
+        tracker.reserve_schedule.return_value = True
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler = TikTokScheduler(str(Path(directory) / "schedule.json"))
+            scheduler.add_job(
+                task_id="task-1",
+                subject="Subject",
+                video_path="video.mp4",
+                caption="Caption",
+                scheduled_at="2020-01-01T20:00:00+00:00",
+                provider="official",
+                privacy_level="SELF_ONLY",
+                allow_comment=True,
+                allow_duet=False,
+                allow_stitch=False,
+            )
+
+            def upload_video(*args, **kwargs):
+                kwargs["on_publish_id"]("pub-scheduled")
+                self.assertEqual(scheduler.load()[0]["publish_id"], "pub-scheduled")
+                return {"success": True, "publish_id": "pub-scheduled", "status": "processing"}
+
+            uploader.upload_video.side_effect = upload_video
+            scheduler.run_due_jobs()
+
+        publish_updates = [
+            call for call in tracker.update_status.call_args_list
+            if call.kwargs.get("publish_id") == "pub-scheduled"
+        ]
+        self.assertEqual(len(publish_updates), 1)
 
 
 if __name__ == "__main__":

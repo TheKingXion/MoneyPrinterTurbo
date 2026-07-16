@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from app.config import config
+from app.controllers.v1.video import task_manager
 from app.models.exception import HttpException
 from app.router import root_api_router
 from app.services.tiktok_scheduler import tiktok_scheduler
@@ -24,6 +25,7 @@ from app.utils import utils
 async def application_lifespan(_: FastAPI):
     """Start recovery/schedulers and close their resources with the API process."""
     task_service.recover_interrupted_cross_posts()
+    task_manager.resume_queued_tasks()
     try:
         profile = performance.get_runtime_profile()
         logger.info(

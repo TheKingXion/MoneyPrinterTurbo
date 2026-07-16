@@ -16,6 +16,7 @@ from app.models.exception import HttpException
 from app.models.schema import TaskListResponse, TaskQueryResponse
 from app.services import state as sm
 from app.utils import utils
+from app.utils import upload as upload_utils
 
 
 class TestVideoControllerHelpers(unittest.TestCase):
@@ -47,7 +48,19 @@ class TestVideoControllerHelpers(unittest.TestCase):
 
         with patch.object(
             task_service, "recover_interrupted_cross_posts"
-        ) as recover:
+        ) as recover, patch.object(
+            asgi.task_manager, "resume_queued_tasks"
+        ) as resume_tasks, patch.object(
+            asgi.performance, "get_runtime_profile"
+        ), patch.object(
+            asgi.tiktok_scheduler, "start"
+        ) as start_tiktok, patch.object(
+            asgi.tiktok_scheduler, "stop"
+        ) as stop_tiktok, patch.object(
+            asgi.youtube_batch_runner, "resume_pending"
+        ) as resume_youtube, patch.object(
+            asgi.youtube_batch_runner, "shutdown"
+        ) as shutdown_youtube:
             async def run_lifespan():
                 async with asgi.application_lifespan(asgi.app):
                     pass
@@ -55,6 +68,11 @@ class TestVideoControllerHelpers(unittest.TestCase):
             asyncio.run(run_lifespan())
 
         recover.assert_called_once_with()
+        resume_tasks.assert_called_once_with()
+        start_tiktok.assert_called_once_with()
+        stop_tiktok.assert_called_once_with()
+        resume_youtube.assert_called_once_with()
+        shutdown_youtube.assert_called_once_with()
 
     def test_sanitize_upload_filename_rejects_empty_name(self):
         """空文件名和目录占位符不能进入服务端存储路径。"""
@@ -171,6 +189,27 @@ class TestVideoControllerTasks(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 429)
+        delete_task.assert_called_once_with("task-123")
+
+    def test_create_task_removes_state_on_unexpected_enqueue_failure(self):
+        body = MagicMock()
+        body.model_dump.return_value = {"video_subject": "Coffee"}
+
+        with (
+            patch.object(video_controller.utils, "get_uuid", return_value="task-123"),
+            patch.object(video_controller.sm.state, "update_task"),
+            patch.object(
+                video_controller.task_manager,
+                "add_task",
+                side_effect=RuntimeError("redis unavailable"),
+            ),
+            patch.object(video_controller.sm.state, "delete_task") as delete_task,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "redis unavailable"):
+                video_controller.create_task(
+                    self._request(), body, stop_at="video"
+                )
+
         delete_task.assert_called_once_with("task-123")
 
     def test_get_all_tasks_preserves_pagination(self):
@@ -361,13 +400,15 @@ class TestVideoControllerFiles(unittest.TestCase):
                 video_controller.utils,
                 "storage_dir",
                 return_value=temp_dir,
-            ):
+            ), patch.object(video_controller, "_validate_video_material"):
                 response = video_controller.upload_video_material_file(
                     self._request(), upload
                 )
 
-            self.assertEqual(response["data"]["file"], "clip.MOV")
-            self.assertEqual(Path(temp_dir, "clip.MOV").read_bytes(), b"video")
+            stored_name = response["data"]["file"]
+            self.assertTrue(stored_name.endswith(".mov"))
+            self.assertNotEqual(stored_name, "clip.MOV")
+            self.assertEqual(Path(temp_dir, stored_name).read_bytes(), b"video")
 
             invalid_upload = SimpleNamespace(
                 filename="photojpg",
@@ -378,6 +419,95 @@ class TestVideoControllerFiles(unittest.TestCase):
                     self._request(), invalid_upload
                 )
             self.assertEqual(raised.exception.status_code, 400)
+
+    def test_atomic_upload_rejects_empty_and_oversized_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for content, expected_message in (
+                (b"", "empty"),
+                (b"12345", "per-file"),
+            ):
+                with self.subTest(content=content), self.assertRaises(
+                    upload_utils.UploadRejectedError
+                ) as raised:
+                    upload_utils.save_upload_atomically(
+                        BytesIO(content),
+                        temp_dir,
+                        ".mp4",
+                        max_file_bytes=4,
+                        max_total_bytes=100,
+                    )
+                self.assertIn(expected_message, str(raised.exception))
+                self.assertEqual(
+                    [name for name in os.listdir(temp_dir) if name != ".upload.lock"],
+                    [],
+                )
+
+    def test_atomic_upload_enforces_total_directory_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "active.mp4").write_bytes(b"1234")
+
+            with self.assertRaises(upload_utils.UploadRejectedError) as raised:
+                upload_utils.save_upload_atomically(
+                    BytesIO(b"56"),
+                    temp_dir,
+                    ".mp4",
+                    max_file_bytes=10,
+                    max_total_bytes=5,
+                )
+
+            self.assertIn("total", str(raised.exception))
+            self.assertEqual(Path(temp_dir, "active.mp4").read_bytes(), b"1234")
+            self.assertEqual(
+                [name for name in os.listdir(temp_dir) if name != ".upload.lock"],
+                ["active.mp4"],
+            )
+
+    def test_atomic_upload_avoids_generated_name_collision(self):
+        collision = SimpleNamespace(hex="a" * 32)
+        available = SimpleNamespace(hex="b" * 32)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_path = Path(temp_dir, f"{collision.hex}.mp4")
+            active_path.write_bytes(b"active")
+
+            with patch.object(
+                upload_utils, "uuid4", side_effect=[collision, available]
+            ):
+                stored_name, _ = upload_utils.save_upload_atomically(
+                    BytesIO(b"new"),
+                    temp_dir,
+                    ".mp4",
+                    max_file_bytes=10,
+                    max_total_bytes=100,
+                )
+
+            self.assertEqual(stored_name, f"{available.hex}.mp4")
+            self.assertEqual(active_path.read_bytes(), b"active")
+            self.assertEqual(Path(temp_dir, stored_name).read_bytes(), b"new")
+
+    def test_atomic_upload_exposes_target_only_through_replace(self):
+        generated = SimpleNamespace(hex="c" * 32)
+        observations = []
+        real_replace = os.replace
+
+        def observe_replace(source, target):
+            observations.append(
+                (Path(source).read_bytes(), os.path.exists(target))
+            )
+            real_replace(source, target)
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            upload_utils, "uuid4", return_value=generated
+        ), patch.object(upload_utils.os, "replace", side_effect=observe_replace):
+            stored_name, _ = upload_utils.save_upload_atomically(
+                BytesIO(b"complete"),
+                temp_dir,
+                ".mp4",
+                max_file_bytes=20,
+                max_total_bytes=100,
+            )
+
+            self.assertEqual(observations, [(b"complete", False)])
+            self.assertEqual(Path(temp_dir, stored_name).read_bytes(), b"complete")
 
     def test_stream_video_returns_requested_bytes(self):
         """Range 响应的正文和 Content-Range 必须与计算出的区间一致。"""
