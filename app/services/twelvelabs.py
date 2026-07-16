@@ -30,13 +30,14 @@ Configure a TwelveLabs API key from the TwelveLabs dashboard (https://twelvelabs
 """
 
 import math
+import time
 from functools import lru_cache
 from typing import List, Optional
 
 from loguru import logger
 
 from app.config import config
-from app.services import material
+from app.services import api_usage, material
 
 DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
@@ -89,7 +90,17 @@ def embed_text(text: str, model: Optional[str] = None) -> Optional[List[float]]:
 @lru_cache(maxsize=512)
 def _embed_text_cached(text: str, model: str) -> List[float]:
     client = _client()
+    request_started = time.perf_counter()
     resp = client.embed.create(model_name=model, text=text)
+    api_usage.record_api_call(
+        provider="twelvelabs",
+        model=model,
+        category="embeddings",
+        operation="text_embedding",
+        prompt=text,
+        response=resp,
+        duration_seconds=time.perf_counter() - request_started,
+    )
     # SDK aliases the raw JSON 'float' vector key to `float_`.
     return list(resp.text_embedding.segments[0].float_)
 
@@ -154,11 +165,22 @@ def analyze_clip(
         from twelvelabs.types import VideoContext_Url
 
         client = _client()
+        request_started = time.perf_counter()
         resp = client.analyze(
             model_name=model,
             video=VideoContext_Url(url=video_url),
             prompt=prompt,
             max_tokens=max(max_tokens, _PEGASUS_MIN_MAX_TOKENS),
+        )
+        api_usage.record_api_call(
+            provider="twelvelabs",
+            model=model,
+            category="video_analysis",
+            operation="analyze_clip",
+            prompt=prompt,
+            output=resp.data,
+            response=resp,
+            duration_seconds=time.perf_counter() - request_started,
         )
         return resp.data
     except Exception as e:  # noqa: BLE001

@@ -5,6 +5,23 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.9] - 2026-07-16
+
+### Added
+
+- A persistent API usage meter grouped by provider, model, category, and
+  operation, with period and dimension filters plus recent activity.
+- Token accounting for LLM generation, Gemini and MiMo speech synthesis, and
+  TwelveLabs embeddings and video analysis.
+
+### Changed
+
+- Provider-reported token counts are retained when available; otherwise the
+  dashboard clearly marks conservative estimates.
+- API metering stores only operational metadata and never persists prompts,
+  model responses, or API keys.
+- Advanced the fork version from `1.3.2+custom.8` to `1.3.2+custom.9`.
+
 ## [1.3.2+custom.8] - 2026-07-16
 
 ### Added

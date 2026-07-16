@@ -10,6 +10,7 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.services import api_usage
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 
 _max_retries = 5
@@ -607,6 +608,10 @@ def _generate_response_legacy(prompt: str) -> str:
 
 
 def _generate_response(prompt: str) -> str:
+    started_at = perf_counter()
+    llm_provider = "unknown"
+    model_name = "unknown"
+    request_sent = False
     try:
         llm_provider = str(
             config.app.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
@@ -633,6 +638,17 @@ def _generate_response(prompt: str) -> str:
             )
 
         adapter = provider.adapter
+
+        def tracked(text: str, response=None) -> str:
+            api_usage.record_api_call(
+                provider=llm_provider,
+                model=model_name,
+                prompt=prompt,
+                output=text,
+                response=response,
+                duration_seconds=perf_counter() - started_at,
+            )
+            return text
         if llm_provider == "ollama":
             api_key = "ollama"
             if not base_url:
@@ -675,16 +691,18 @@ def _generate_response(prompt: str) -> str:
                     "g4f package is not installed by default. Install the optional dependency "
                     "with `uv sync --extra g4f` only if you understand and accept the provider risks."
                 ) from e
+            request_sent = True
             content = g4f.ChatCompletion.create(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
-            return _normalize_text_response(content, llm_provider)
+            return tracked(_normalize_text_response(content, llm_provider))
 
         if adapter == "qwen":
             import dashscope
             from dashscope.api_entities.dashscope_response import GenerationResponse
 
             dashscope.api_key = api_key
+            request_sent = True
             response = dashscope.Generation.call(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
@@ -694,7 +712,7 @@ def _generate_response(prompt: str) -> str:
                 raise ValueError(f'[{llm_provider}] returned an invalid response: "{response}"')
             if response.status_code != 200:
                 raise ValueError(f'[{llm_provider}] returned an error response: "{response}"')
-            return _extract_qwen_generation_text(response)
+            return tracked(_extract_qwen_generation_text(response), response)
 
         if adapter == "gemini":
             from google import genai
@@ -718,6 +736,7 @@ def _generate_response(prompt: str) -> str:
             )
             try:
                 with genai.Client(api_key=api_key, http_options=http_options) as client:
+                    request_sent = True
                     response = client.models.generate_content(
                         model=model_name, contents=prompt, config=generation_config
                     )
@@ -725,7 +744,9 @@ def _generate_response(prompt: str) -> str:
             except (AttributeError, IndexError, ValueError) as e:
                 logger.warning(f"gemini returned invalid response content: {e}")
                 raise ValueError(f"[{llm_provider}] returned invalid response content")
-            return _normalize_text_response(generated_text, llm_provider)
+            return tracked(
+                _normalize_text_response(generated_text, llm_provider), response
+            )
 
         if adapter == "ernie":
             token_response = requests.post(
@@ -740,6 +761,7 @@ def _generate_response(prompt: str) -> str:
             access_token = token_response.json().get("access_token")
             if not access_token:
                 raise ValueError("[ernie] token response did not contain an access token")
+            request_sent = True
             response = requests.post(
                 base_url,
                 params={"access_token": access_token},
@@ -754,7 +776,10 @@ def _generate_response(prompt: str) -> str:
                 },
             )
             response.raise_for_status()
-            return _normalize_text_response(response.json().get("result"), llm_provider)
+            payload = response.json()
+            return tracked(
+                _normalize_text_response(payload.get("result"), llm_provider), payload
+            )
 
         if adapter == "cloudflare_ai_gateway":
             client = OpenAI(
@@ -765,14 +790,16 @@ def _generate_response(prompt: str) -> str:
                 ),
                 default_headers={"cf-aig-gateway-id": extra_values["gateway_id"]},
             )
+            request_sent = True
             response = client.chat.completions.create(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
-            return _extract_chat_completion_text(response, llm_provider)
+            return tracked(_extract_chat_completion_text(response, llm_provider), response)
 
         if adapter == "litellm":
             import litellm
 
+            request_sent = True
             response = litellm.completion(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
@@ -780,7 +807,7 @@ def _generate_response(prompt: str) -> str:
             )
             if not response or not getattr(response, "choices", None):
                 raise ValueError(f"[{llm_provider}] returned empty response")
-            return _extract_chat_completion_text(response, llm_provider)
+            return tracked(_extract_chat_completion_text(response, llm_provider), response)
 
         if adapter == "azure":
             api_version = config.app.get(
@@ -789,14 +816,16 @@ def _generate_response(prompt: str) -> str:
             client = AzureOpenAI(
                 api_key=api_key, api_version=api_version, azure_endpoint=base_url
             )
+            request_sent = True
             response = client.chat.completions.create(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
-            return _extract_chat_completion_text(response, llm_provider)
+            return tracked(_extract_chat_completion_text(response, llm_provider), response)
 
         if adapter == "modelscope":
             content = ""
             client = OpenAI(api_key=api_key, base_url=base_url)
+            request_sent = True
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
@@ -809,21 +838,31 @@ def _generate_response(prompt: str) -> str:
                 delta = chunk.choices[0].delta
                 if delta and delta.content:
                     content += delta.content
-            return _normalize_text_response(content, llm_provider)
+            return tracked(_normalize_text_response(content, llm_provider))
 
         client = OpenAI(api_key=api_key, base_url=base_url)
+        request_sent = True
         response = client.chat.completions.create(
             model=model_name, messages=[{"role": "user", "content": prompt}]
         )
-        return _extract_chat_completion_text(response, llm_provider)
+        return tracked(_extract_chat_completion_text(response, llm_provider), response)
     except Exception as e:
+        if request_sent:
+            api_usage.record_api_call(
+                provider=llm_provider,
+                model=model_name,
+                prompt=prompt,
+                status="failed",
+                duration_seconds=perf_counter() - started_at,
+            )
         return f"Error: {_sanitize_error_message(e)}"
 
 
 def test_connection() -> tuple[bool, str, float]:
     """Test the active provider with one minimal generation request."""
     started_at = perf_counter()
-    response = _generate_response(prompt="Reply with exactly: OK")
+    with api_usage.usage_context("diagnostics", "connection_test"):
+        response = _generate_response(prompt="Reply with exactly: OK")
     elapsed = perf_counter() - started_at
     if not response:
         return False, "LLM returned an empty response", elapsed
@@ -978,7 +1017,8 @@ def generate_script(
 
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt=prompt)
+            with api_usage.usage_context("script", "generate_script"):
+                response = _generate_response(prompt=prompt)
             if not response:
                 raise ValueError("gpt returned an empty response")
             candidate = format_response(response).strip()
@@ -1101,7 +1141,8 @@ def generate_batch_ideas(
     last_error = ""
     for attempt in range(_max_retries):
         try:
-            response = _generate_response(prompt)
+            with api_usage.usage_context("ideas", "generate_batch_ideas"):
+                response = _generate_response(prompt)
             if not response or response.startswith("Error:"):
                 raise ValueError(response or "empty idea response")
             ideas = _parse_batch_ideas(response, amount)
@@ -1354,7 +1395,8 @@ Please note that you must use English for generating video search terms; Chinese
     response = ""
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt)
+            with api_usage.usage_context("search_terms", "generate_terms"):
+                response = _generate_response(prompt)
             if "Error: " in response:
                 logger.error(f"failed to generate video script: {response}")
                 return response
@@ -1419,7 +1461,8 @@ Draft queries:
 {json.dumps(search_terms, ensure_ascii=False)}
 """.strip()
         try:
-            refined_response = _generate_response(refinement_prompt)
+            with api_usage.usage_context("search_terms", "refine_terms"):
+                refined_response = _generate_response(refinement_prompt)
             refined_terms = json.loads(_strip_code_fence(refined_response))
             if (
                 isinstance(refined_terms, list)
@@ -1715,7 +1758,8 @@ def generate_social_metadata(
     response = ""
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt)
+            with api_usage.usage_context("social_metadata", "generate_social_metadata"):
+                response = _generate_response(prompt)
             if isinstance(response, str) and "Error: " in response:
                 logger.error(f"failed to generate social metadata: {response}")
                 break

@@ -3548,9 +3548,10 @@ def _render_application():
         params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
     )
 
-    from webui.components import performance_panel
+    from webui.components import api_usage_panel, performance_panel
 
     performance_panel.render(tr)
+    api_usage_panel.render(tr)
     youtube_panel.render(tr, params)
     tiktok_panel.render(tr, params)
 

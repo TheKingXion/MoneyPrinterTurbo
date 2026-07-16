@@ -24,6 +24,7 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from openai import OpenAI
 
 from app.config import config
+from app.services import api_usage
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
@@ -1067,6 +1068,7 @@ def gemini_tts(
         ensure_file_path_exists(voice_file)
 
         client = genai.Client(api_key=api_key)
+        request_started = time.perf_counter()
         response = client.models.generate_content(
             model="gemini-2.5-flash-preview-tts",
             contents=text,
@@ -1080,6 +1082,15 @@ def gemini_tts(
                     )
                 ),
             ),
+        )
+        api_usage.record_api_call(
+            provider="gemini",
+            model="gemini-2.5-flash-preview-tts",
+            category="tts",
+            operation="gemini_tts",
+            prompt=text,
+            response=response,
+            duration_seconds=time.perf_counter() - request_started,
         )
         
         # 检查响应
@@ -1192,6 +1203,7 @@ def mimo_tts(
             ensure_file_path_exists(voice_file)
 
             client = OpenAI(api_key=api_key, base_url=base_url)
+            request_started = time.perf_counter()
             completion = client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -1202,6 +1214,15 @@ def mimo_tts(
                     "format": "wav",
                     "voice": voice_name,
                 },
+            )
+            api_usage.record_api_call(
+                provider="mimo",
+                model=model_name,
+                category="tts",
+                operation="mimo_tts",
+                prompt=f"{style_prompt}\n{text}",
+                response=completion,
+                duration_seconds=time.perf_counter() - request_started,
             )
 
             if not completion or not getattr(completion, "choices", None):
