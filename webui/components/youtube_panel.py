@@ -239,14 +239,36 @@ def _render_batch_history(tr) -> None:
         st.info(tr("None"))
 
 
+MAX_BATCH_IDEAS = 200
+IDEA_GENERATION_CHUNK_SIZE = 12
+
+
+def _score_idea_rows(rows: list[dict]) -> list[dict]:
+    scored = []
+    for row in rows:
+        item = dict(row)
+        quality = audit_story_idea(
+            str(item.get("subject", "")),
+            str(item.get("title_override", "")),
+        )
+        item["score"] = quality["score"]
+        item["perfect"] = quality["score"] == 100
+        item["review_notes"] = "; ".join(quality["issues"])
+        item["locked"] = bool(item.get("locked")) and item["perfect"]
+        scored.append(item)
+    return scored
+
+
 def _generate_unique_idea_rows(topic: str, total: int, language: str, existing: list[str]) -> list[dict]:
     accepted = []
     blocked = list(existing)
-    for _ in range(3):
+    maximum_calls = max(3, ((max(0, total) + IDEA_GENERATION_CHUNK_SIZE - 1) // IDEA_GENERATION_CHUNK_SIZE) * 3)
+    for _ in range(maximum_calls):
         missing = total - len(accepted)
         if missing <= 0:
             break
-        generated = llm.generate_batch_ideas(topic, missing, language, blocked)
+        requested = min(missing, IDEA_GENERATION_CHUNK_SIZE)
+        generated = llm.generate_batch_ideas(topic, requested, language, blocked)
         audit = validate_unique_ideas(
             [row.get("subject", "") for row in generated],
             blocked,
@@ -258,12 +280,44 @@ def _generate_unique_idea_rows(topic: str, total: int, language: str, existing: 
                 {
                     "subject": result["subject"],
                     "title_override": row.get("title_override", ""),
+                    "locked": False,
                 }
             )
             blocked.append(result["subject"])
     if len(accepted) != total:
         raise RuntimeError("Unable to prepare the requested number of unique ideas")
-    return accepted
+    return _score_idea_rows(accepted)
+
+
+def _regenerate_unlocked_idea_rows(
+    topic: str,
+    total: int,
+    language: str,
+    existing: list[str],
+    rows: list[dict],
+) -> list[dict]:
+    scored = _score_idea_rows(rows[:total])
+    locked_by_index = {
+        index: row
+        for index, row in enumerate(scored)
+        if row.get("locked") and row.get("perfect")
+    }
+    locked_subjects = [row["subject"] for row in locked_by_index.values()]
+    replacements = iter(
+        _generate_unique_idea_rows(
+            topic,
+            total - len(locked_by_index),
+            language,
+            [*existing, *locked_subjects],
+        )
+    )
+    result = []
+    for index in range(total):
+        if index in locked_by_index:
+            result.append(locked_by_index[index])
+        else:
+            result.append(next(replacements))
+    return _score_idea_rows(result)
 
 
 def _render_batch(tr, base_params: VideoParams) -> None:
@@ -285,7 +339,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
 
     st.markdown(f"### 1. {tr('Prepare batch ideas')}")
     top_columns = st.columns([1, 1])
-    total = int(top_columns[0].number_input(tr("Total videos"), 1, 100, 10, key="yt_batch_total"))
+    total = int(top_columns[0].number_input(tr("Total videos"), 1, MAX_BATCH_IDEAS, 10, key="yt_batch_total"))
     idea_mode_labels = {
         "ai": tr("Generate ideas with AI"),
         "manual": tr("Paste my own subjects"),
@@ -348,20 +402,47 @@ def _render_batch(tr, base_params: VideoParams) -> None:
             st.session_state.pop("yt_batch_idea_editor", None)
             st.rerun()
 
-    rows = st.session_state.setdefault("yt_batch_idea_rows", [])
+    rows = _score_idea_rows(st.session_state.setdefault("yt_batch_idea_rows", []))
     edited_rows = st.data_editor(
         rows,
-        column_order=["subject", "title_override"],
+        column_order=["locked", "perfect", "score", "subject", "title_override", "review_notes"],
         column_config={
+            "locked": st.column_config.CheckboxColumn(tr("Lock idea"), help=tr("Only perfect 100/100 ideas can be locked.")),
+            "perfect": st.column_config.CheckboxColumn(tr("Perfect"), disabled=True),
+            "score": st.column_config.NumberColumn(tr("Quality Score"), min_value=0, max_value=100, format="%d/100", disabled=True),
             "subject": st.column_config.TextColumn(tr("Story brief"), required=True, width="large"),
             "title_override": st.column_config.TextColumn(tr("YouTube title optional"), max_chars=100, width="medium"),
+            "review_notes": st.column_config.TextColumn(tr("Review Notes"), disabled=True, width="medium"),
         },
         num_rows="dynamic",
         hide_index=True,
         width="stretch",
         key="yt_batch_idea_editor",
     )
+    edited_rows = _score_idea_rows(edited_rows)
     st.session_state["yt_batch_idea_rows"] = edited_rows
+    if idea_mode == "ai" and edited_rows:
+        idea_actions = st.columns(2)
+        if idea_actions[0].button(tr("Lock all perfect ideas"), key="yt_batch_lock_perfect"):
+            for row in edited_rows:
+                row["locked"] = bool(row.get("perfect"))
+            st.session_state["yt_batch_idea_rows"] = edited_rows
+            st.session_state.pop("yt_batch_idea_editor", None)
+            st.rerun()
+        if idea_actions[1].button(tr("Regenerate unlocked ideas"), key="yt_batch_regenerate_unlocked", type="primary"):
+            try:
+                with st.spinner(tr("Generating Video Script and Keywords")):
+                    st.session_state["yt_batch_idea_rows"] = _regenerate_unlocked_idea_rows(
+                        idea_prompt,
+                        total,
+                        base_params.video_language or "Spanish (Latin America)",
+                        existing,
+                        edited_rows,
+                    )
+                    st.session_state.pop("yt_batch_idea_editor", None)
+                    st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
     subjects = [str(row.get("subject", "")).strip() for row in edited_rows if str(row.get("subject", "")).strip()]
     title_overrides = [str(row.get("title_override", "")).strip() for row in edited_rows if str(row.get("subject", "")).strip()]
     idea_audit = validate_unique_ideas(subjects, existing)
@@ -373,10 +454,7 @@ def _render_batch(tr, base_params: VideoParams) -> None:
                 f"({duplicate['similarity']:.0%})"
             )
     st.caption(f"{tr('Prepared subjects')}: {len(subjects)}/{total}")
-    quality_rows = [
-        audit_story_idea(subject, title_overrides[index])
-        for index, subject in enumerate(subjects)
-    ]
+    quality_rows = [audit_story_idea(subject, title_overrides[index]) for index, subject in enumerate(subjects)]
     if subjects:
         st.dataframe(
             [

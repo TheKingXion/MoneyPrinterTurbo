@@ -25,8 +25,8 @@ from moviepy import (
     VideoFileClip,
     afx,
 )
-from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from moviepy.video.tools.subtitles import SubtitlesClip, file_to_subtitles
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
 
 from app.config import config
 from app.models import const
@@ -490,6 +490,186 @@ def _mux_video_with_audio_copy(
     _write_output_atomically(output_file, write)
 
 
+def _escape_ffmpeg_filter_value(value: str) -> str:
+    return (
+        os.path.abspath(value)
+        .replace("\\", "/")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+    )
+
+
+def _ass_color(value: str) -> str:
+    red, green, blue = ImageColor.getrgb(str(value or "#FFFFFF"))
+    return f"&H00{blue:02X}{green:02X}{red:02X}"
+
+
+def _subtitle_font_family(font_path: str, font_size: int) -> str:
+    try:
+        family = ImageFont.truetype(font_path, max(8, int(font_size))).getname()[0]
+    except Exception:
+        family = os.path.splitext(os.path.basename(font_path))[0]
+    return str(family).replace(",", " ").replace("'", "")
+
+
+def _subtitle_timestamp(seconds: float) -> str:
+    milliseconds = max(0, int(round(float(seconds) * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def _prepare_ffmpeg_subtitle_file(
+    subtitle_path: str,
+    output_file: str,
+    font_path: str,
+    font_size: int,
+    video_width: int,
+) -> str:
+    """Write explicit PIL-compatible line breaks so libass matches the UI."""
+
+    prepared_path = (
+        f"{os.path.splitext(output_file)[0]}.{uuid.uuid4().hex}.ffmpeg.srt"
+    )
+    try:
+        entries = file_to_subtitles(subtitle_path, encoding="utf-8")
+        with open(prepared_path, "w", encoding="utf-8") as prepared:
+            for index, ((start, end), phrase) in enumerate(entries, start=1):
+                wrapped, _ = wrap_text(
+                    str(phrase).replace("\n", " "),
+                    max_width=video_width * 0.9,
+                    font=font_path,
+                    fontsize=int(font_size),
+                )
+                prepared.write(
+                    f"{index}\n{_subtitle_timestamp(start)} --> "
+                    f"{_subtitle_timestamp(end)}\n{wrapped}\n\n"
+                )
+    except Exception:
+        delete_files(prepared_path)
+        raise
+    return prepared_path
+
+
+def _render_simple_subtitles_with_ffmpeg(
+    video_path: str,
+    audio_path: str,
+    subtitle_path: str,
+    output_file: str,
+    params: VideoParams,
+    font_path: str,
+    video_width: int,
+    video_height: int,
+) -> str:
+    """Render common no-background subtitles in FFmpeg instead of Python frames."""
+
+    codec = _get_effective_video_codec(_get_configured_video_codec())
+    alignment = {"bottom": 2, "center": 5, "top": 8}.get(
+        str(params.subtitle_position), 2
+    )
+    prepared_subtitle_path = _prepare_ffmpeg_subtitle_file(
+        subtitle_path,
+        output_file,
+        font_path,
+        int(params.font_size),
+        video_width,
+    )
+    # SRT is rendered on libass' implicit PlayResY=288 canvas. Convert the
+    # pixel-based UI values so 52 px does not become ~350 px on a 1920p frame.
+    ass_scale = 288.0 / max(1, video_height)
+    ass_font_size = max(1.0, float(params.font_size) * ass_scale * 1.15)
+    ass_outline = max(0.0, float(params.stroke_width) * ass_scale * 1.15)
+    try:
+        font_style = ImageFont.truetype(
+            font_path, max(8, int(params.font_size))
+        ).getname()[1]
+    except Exception:
+        font_style = os.path.basename(font_path)
+    bold = -1 if "bold" in str(font_style).casefold() else 0
+    margin_v = int(video_height * 0.05 * ass_scale) if alignment in {2, 8} else 0
+    style = ",".join(
+        (
+            f"FontName={_subtitle_font_family(font_path, params.font_size)}",
+            f"FontSize={ass_font_size:.2f}",
+            f"PrimaryColour={_ass_color(params.text_fore_color)}",
+            f"OutlineColour={_ass_color(params.stroke_color)}",
+            f"Outline={ass_outline:.2f}",
+            f"Bold={bold}",
+            "Shadow=0",
+            f"Alignment={alignment}",
+            f"MarginV={margin_v}",
+            "WrapStyle=2",
+        )
+    )
+    subtitle_filter = (
+        f"subtitles=filename='{_escape_ffmpeg_filter_value(prepared_subtitle_path)}':"
+        f"fontsdir='{_escape_ffmpeg_filter_value(os.path.dirname(font_path))}':"
+        f"original_size={video_width}x{video_height}:force_style='{style}'"
+    )
+
+    def run(selected_codec: str, partial_file: str):
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            subtitle_filter,
+            "-c:v",
+            selected_codec,
+        ]
+        preset = performance.encoder_preset(selected_codec)
+        if preset:
+            command.extend(["-preset", preset])
+        command.extend(
+            [
+                "-threads",
+                str(max(1, int(params.n_threads or 2))),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                audio_codec,
+                "-b:a",
+                audio_bitrate,
+            ]
+        )
+        if abs(float(params.voice_volume) - 1.0) > 0.001:
+            command.extend(["-af", f"volume={float(params.voice_volume):.4f}"])
+        command.extend(["-shortest", partial_file])
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout or "FFmpeg subtitle render failed").strip()
+            )
+        return selected_codec
+
+    def write(partial_file: str):
+        try:
+            return run(codec, partial_file)
+        except Exception as hardware_error:
+            if codec == _DEFAULT_VIDEO_CODEC:
+                raise
+            delete_files(partial_file)
+            fallback_codec = run(_DEFAULT_VIDEO_CODEC, partial_file)
+            _disable_runtime_video_codec(codec, str(hardware_error))
+            return fallback_codec
+
+    try:
+        return _write_output_atomically(output_file, write)
+    finally:
+        delete_files(prepared_subtitle_path)
+
+
 def concat_video_clips_with_ffmpeg(
     clip_files: List[str],
     output_file: str,
@@ -676,6 +856,8 @@ def delete_files(files: List[str] | str):
     for file in files:
         try:
             os.remove(file)
+        except FileNotFoundError:
+            pass
         except Exception as e:
             logger.debug(f"failed to delete file {file}: {str(e)}")
 
@@ -1202,6 +1384,37 @@ def generate_video(
             font_path = font_path.replace("\\", "/")
 
         logger.info(f"  ⑤ font: {font_path}")
+
+    simple_subtitle_path = (
+        params.subtitle_enabled
+        and subtitle_path
+        and os.path.isfile(subtitle_path)
+        and no_bgm_requested
+        and not bool(params.text_background_color)
+        and not bool(getattr(params, "rounded_subtitle_background", False))
+        and str(params.subtitle_position) in {"bottom", "center", "top"}
+    )
+    if simple_subtitle_path:
+        try:
+            used_codec = _render_simple_subtitles_with_ffmpeg(
+                video_path=video_path,
+                audio_path=audio_path,
+                subtitle_path=subtitle_path,
+                output_file=output_file,
+                params=params,
+                font_path=font_path,
+                video_width=video_width,
+                video_height=video_height,
+            )
+            logger.info(
+                f"rendered simple subtitles with FFmpeg codec={used_codec}"
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "fast FFmpeg subtitle rendering failed; falling back to "
+                f"MoviePy: {str(exc)}"
+            )
 
     def resolve_subtitle_background_color():
         # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，

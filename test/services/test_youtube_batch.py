@@ -61,6 +61,16 @@ class TestYouTubeBatch(unittest.TestCase):
         self.assertLess(idea_similarity(rural, urban), 0.74)
         self.assertFalse(validate_unique_ideas([urban], [rural])[0]["duplicate"])
 
+    def test_bulk_duplicate_scan_skips_unrelated_sequence_comparisons(self):
+        existing = [f"conceptoexclusivo{index}" for index in range(500)]
+        candidates = [f"propuestaunica{index}" for index in range(200)]
+
+        with patch("app.services.youtube_batch.SequenceMatcher") as matcher:
+            results = validate_unique_ideas(candidates, existing)
+
+        self.assertFalse(any(row["duplicate"] for row in results))
+        matcher.assert_not_called()
+
     def test_store_persists_title_override_and_rejects_repeated_premise(self):
         with tempfile.TemporaryDirectory() as directory:
             store = YouTubeBatchStore(directory)

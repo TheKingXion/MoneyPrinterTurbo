@@ -1429,6 +1429,14 @@ class PerformanceTelemetry:
                     connection.execute(
                         f"ALTER TABLE resource_samples ADD COLUMN {name} {sql_type}"
                     )
+            # Rows still marked running belong to a previous process. Closing
+            # them at startup keeps audits and throughput estimates honest.
+            for table in ("task_runs", "stage_runs"):
+                connection.execute(
+                    f"UPDATE {table} SET finished_at=started_at, duration=0, "
+                    "status='interrupted', error=COALESCE(error, 'process interrupted') "
+                    "WHERE status='running'"
+                )
             cutoff = time.time() - _TELEMETRY_RETENTION_SECONDS
             connection.execute(
                 "DELETE FROM resource_samples WHERE sampled_at < ?", (cutoff,)

@@ -336,6 +336,94 @@ class TestVideoService(unittest.TestCase):
             "combined.mp4", "audio.mp3", "final.mp4", 0.8
         )
 
+    def test_generate_video_uses_fast_ffmpeg_subtitle_path(self):
+        params = types.SimpleNamespace(
+            video_aspect="9:16",
+            subtitle_enabled=True,
+            bgm_type="",
+            voice_volume=1.0,
+            font_name="MicrosoftYaHeiBold.ttc",
+            font_size=52,
+            text_fore_color="#FFFFFF",
+            stroke_color="#000000",
+            stroke_width=1.5,
+            text_background_color=False,
+            rounded_subtitle_background=False,
+            subtitle_position="bottom",
+            n_threads=12,
+        )
+        with (
+            patch.object(vd.os.path, "isfile", return_value=True),
+            patch.object(
+                vd,
+                "_render_simple_subtitles_with_ffmpeg",
+                return_value="h264_amf",
+            ) as render,
+        ):
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="audio.mp3",
+                subtitle_path="subtitle.srt",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        self.assertTrue(result)
+        render.assert_called_once()
+
+    def test_fast_subtitle_render_uses_libass_and_atomic_output(self):
+        params = types.SimpleNamespace(
+            subtitle_position="bottom",
+            font_size=52,
+            text_fore_color="#FFFFFF",
+            stroke_color="#112233",
+            stroke_width=1.5,
+            n_threads=12,
+            voice_volume=0.8,
+        )
+
+        def fake_run(command, capture_output, text, check):
+            Path(command[-1]).write_bytes(b"subtitle-video")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "final.mp4")
+            subtitle_file = os.path.join(temp_dir, "subtitle.srt")
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nTexto de prueba\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+                patch.object(vd, "_get_effective_video_codec", return_value="libx264"),
+                patch.object(vd.utils, "get_ffmpeg_binary", return_value="ffmpeg"),
+                patch.object(vd.subprocess, "run", side_effect=fake_run) as run,
+                patch.object(vd, "_subtitle_font_family", return_value="Test Font"),
+            ):
+                codec = vd._render_simple_subtitles_with_ffmpeg(
+                    "combined.mp4",
+                    "audio.mp3",
+                    subtitle_file,
+                    output_file,
+                    params,
+                    os.path.join(temp_dir, "font.ttf"),
+                    1080,
+                    1920,
+                )
+
+            self.assertEqual(codec, "libx264")
+            self.assertEqual(Path(output_file).read_bytes(), b"subtitle-video")
+            self.assertEqual(list(Path(temp_dir).glob("*.partial.*")), [])
+
+        command = run.call_args.args[0]
+        subtitle_filter = command[command.index("-vf") + 1]
+        self.assertIn("subtitles=", subtitle_filter)
+        self.assertIn("Alignment=2", subtitle_filter)
+        self.assertIn("FontSize=8.97", subtitle_filter)
+        self.assertIn("WrapStyle=2", subtitle_filter)
+        self.assertEqual(command[command.index("-threads") + 1], "12")
+        self.assertEqual(command[command.index("-af") + 1], "volume=0.8000")
+
     def test_audio_mux_copies_video_and_applies_volume(self):
         def fake_run(command, capture_output, text, check):
             Path(command[-1]).write_bytes(b"muxed-video")

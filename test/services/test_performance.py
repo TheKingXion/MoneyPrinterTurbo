@@ -551,6 +551,33 @@ class TelemetryTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual((tasks, samples), (0, 0))
 
+    def test_initialization_closes_stale_running_rows(self):
+        started = time.time() - 60
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "INSERT INTO task_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("stale", "video", started, None, None, "running", "{}", None),
+            )
+            connection.execute(
+                "INSERT INTO stage_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "stale-stage", "stale", "render", started, None, None,
+                    "running", "{}", None,
+                ),
+            )
+
+        performance.PerformanceTelemetry(self.db)
+
+        with closing(sqlite3.connect(self.db)) as connection:
+            task = connection.execute(
+                "SELECT status, duration, error FROM task_runs WHERE id='stale'"
+            ).fetchone()
+            stage = connection.execute(
+                "SELECT status, duration FROM stage_runs WHERE id='stale-stage'"
+            ).fetchone()
+        self.assertEqual(task, ("interrupted", 0.0, "process interrupted"))
+        self.assertEqual(stage, ("interrupted", 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()

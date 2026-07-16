@@ -111,19 +111,26 @@ def _idea_tokens(value: str) -> set[str]:
     return tokens
 
 
-def idea_similarity(left: str, right: str) -> float:
-    normalized_left = normalize_idea_text(left)
-    normalized_right = normalize_idea_text(right)
+def _idea_signature(value: str) -> tuple[str, frozenset[str]]:
+    normalized = normalize_idea_text(value)
+    return normalized, frozenset(_idea_tokens(normalized))
+
+
+def _signature_similarity(
+    left: tuple[str, frozenset[str]],
+    right: tuple[str, frozenset[str]],
+) -> float:
+    normalized_left, left_tokens = left
+    normalized_right, right_tokens = right
     if not normalized_left or not normalized_right:
         return 0.0
     if normalized_left == normalized_right:
         return 1.0
-    sequence = SequenceMatcher(None, normalized_left, normalized_right).ratio()
-    left_tokens = _idea_tokens(left)
-    right_tokens = _idea_tokens(right)
     if not left_tokens or not right_tokens:
-        return sequence
+        return SequenceMatcher(None, normalized_left, normalized_right).ratio()
     intersection = len(left_tokens & right_tokens)
+    if not intersection:
+        return 0.0
     union = len(left_tokens | right_tokens)
     jaccard = intersection / union
     containment = intersection / min(len(left_tokens), len(right_tokens))
@@ -132,16 +139,23 @@ def idea_similarity(left: str, right: str) -> float:
         if min(len(left_tokens), len(right_tokens)) >= 3
         else jaccard
     )
-    if sequence >= 0.92 and semantic >= 0.5:
-        return sequence
+    if semantic >= 0.5:
+        sequence = SequenceMatcher(None, normalized_left, normalized_right).ratio()
+        if sequence >= 0.92:
+            return sequence
     return semantic
 
 
+def idea_similarity(left: str, right: str) -> float:
+    return _signature_similarity(_idea_signature(left), _idea_signature(right))
+
+
 def find_duplicate_idea(candidate: str, existing: Iterable[str], threshold: float = 0.74) -> tuple[str, float] | None:
+    candidate_signature = _idea_signature(candidate)
     best_value = ""
     best_score = 0.0
     for value in existing:
-        score = idea_similarity(candidate, value)
+        score = _signature_similarity(candidate_signature, _idea_signature(value))
         if score > best_score:
             best_value, best_score = str(value), score
     return (best_value, best_score) if best_score >= threshold else None
@@ -149,10 +163,35 @@ def find_duplicate_idea(candidate: str, existing: Iterable[str], threshold: floa
 
 def validate_unique_ideas(candidates: Iterable[str], existing: Iterable[str] = ()) -> list[dict]:
     accepted = [str(value).strip() for value in existing if str(value).strip()]
+    signatures = [_idea_signature(value) for value in accepted]
+    token_index: dict[str, set[int]] = {}
+    empty_token_indices: set[int] = set()
+    for index, (_, tokens) in enumerate(signatures):
+        if not tokens:
+            empty_token_indices.add(index)
+        for token in tokens:
+            token_index.setdefault(token, set()).add(index)
     results = []
     for candidate in candidates:
         value = " ".join(str(candidate).split()).strip(" .")
-        duplicate = find_duplicate_idea(value, accepted) if value else None
+        signature = _idea_signature(value)
+        relevant_indices = set(empty_token_indices)
+        if signature[1]:
+            for token in signature[1]:
+                relevant_indices.update(token_index.get(token, ()))
+        else:
+            relevant_indices.update(range(len(signatures)))
+        best_index = -1
+        best_score = 0.0
+        for index in relevant_indices:
+            score = _signature_similarity(signature, signatures[index])
+            if score > best_score:
+                best_index, best_score = index, score
+        duplicate = (
+            (accepted[best_index], best_score)
+            if best_index >= 0 and best_score >= 0.74
+            else None
+        )
         results.append(
             {
                 "subject": value,
@@ -162,7 +201,13 @@ def validate_unique_ideas(candidates: Iterable[str], existing: Iterable[str] = (
             }
         )
         if value and not duplicate:
+            index = len(accepted)
             accepted.append(value)
+            signatures.append(signature)
+            if not signature[1]:
+                empty_token_indices.add(index)
+            for token in signature[1]:
+                token_index.setdefault(token, set()).add(index)
     return results
 
 

@@ -5,6 +5,33 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.8] - 2026-07-16
+
+### Added
+
+- Per-idea 100/100 scoring, perfect-state visibility, and selective locking in
+  the YouTube batch editor.
+- Regeneration of only unlocked ideas while preserving perfect locked rows in
+  their original positions.
+
+### Changed
+
+- AI idea generation now works in bounded 12-idea chunks and supports batches
+  of up to 200 ideas without depending on one oversized JSON response.
+- Duplicate scanning reuses normalized fingerprints and a token index instead
+  of repeatedly comparing every unrelated idea pair.
+- Simple subtitle videos without background music render through FFmpeg/libass
+  and the selected hardware encoder, retaining the MoviePy path as fallback for
+  complex subtitle backgrounds and audio mixes.
+- Advanced the fork version from `1.3.2+custom.7` to `1.3.2+custom.8`.
+
+### Fixed
+
+- Telemetry rows left running by a previous process are marked interrupted at
+  startup so historical timing audits do not report phantom active tasks.
+- Missing temporary files no longer produce repetitive debug noise during
+  successful atomic video publication.
+
 ## [1.3.2+custom.7] - 2026-07-15
 
 ### Added
