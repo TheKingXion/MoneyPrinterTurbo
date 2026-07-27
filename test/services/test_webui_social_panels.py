@@ -72,6 +72,18 @@ with (
             app.text_area(key="yt_batch_script_prompt").value,
         )
 
+        with patch("streamlit.elements.lib.policies._LOGGER.warning") as warning:
+            app.checkbox(key="yt_batch_interval_enabled").set_value(True).run()
+
+        conflicting_state_warnings = [
+            call
+            for call in warning.call_args_list
+            if "yt_batch_days" in str(call)
+            and "Session State API" in str(call)
+        ]
+        self.assertEqual(conflicting_state_warnings, [])
+        self.assertEqual(app.number_input(key="yt_batch_days").value, 5)
+
     def test_youtube_batch_overrides_script_and_music_settings(self):
         base = VideoParams(
             video_subject="base",

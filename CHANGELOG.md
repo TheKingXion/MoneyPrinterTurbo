@@ -5,6 +5,20 @@ All notable changes maintained in the TheKingXion fork are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 fork releases use the upstream version plus a `custom.N` local version suffix.
 
+## [1.3.2+custom.11] - 2026-07-26
+
+### Fixed
+
+- The YouTube batch scheduling controls no longer emit a Streamlit warning
+  after the first interaction by assigning `yt_batch_days` from both widget
+  defaults and session state.
+- The selected number of scheduling days remains stable across reruns and is
+  reset only when the current batch size makes it invalid.
+
+### Changed
+
+- Advanced the fork version from `1.3.2+custom.10` to `1.3.2+custom.11`.
+
 ## [1.3.2+custom.10] - 2026-07-16
 
 ### Fixed

@@ -499,15 +499,15 @@ def _render_batch(tr, base_params: VideoParams) -> None:
     st.markdown(f"### 3. {tr('Schedule and review')}")
     columns = st.columns(5)
     minimum_days = (total + 14) // 15
-    current_days = int(st.session_state.get("yt_batch_days", min(5, total)) or 1)
-    if current_days < minimum_days or current_days > total:
-        st.session_state["yt_batch_days"] = max(minimum_days, min(5, total))
+    default_days = max(minimum_days, min(5, total))
+    current_days = int(st.session_state.get("yt_batch_days", default_days) or 1)
+    if "yt_batch_days" not in st.session_state or current_days < minimum_days or current_days > total:
+        st.session_state["yt_batch_days"] = default_days
     days = int(
         columns[0].number_input(
             tr("Number of days"),
             min_value=minimum_days,
             max_value=total,
-            value=max(minimum_days, min(5, total)),
             key="yt_batch_days",
         )
     )
