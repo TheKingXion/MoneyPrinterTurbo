@@ -217,6 +217,7 @@ def audit_story_idea(subject: str, title: str = "") -> dict:
     tokens = normalized.split()
     score = 100
     issues = []
+    strengths = []
     generic_patterns = (
         "la historia desconocida de",
         "el secreto detras de",
@@ -231,8 +232,48 @@ def audit_story_idea(subject: str, title: str = "") -> dict:
         "desafia toda la historia",
     )
     action_terms = {
-        "ayudo", "adapto", "construyo", "convirtio", "creo", "enseno", "instalo",
-        "organizo", "recolecto", "recupero", "reparo", "transformo", "crear",
+        "abre", "adapta", "adapto", "ayuda", "ayudo", "busca", "construye",
+        "construyo", "convierte", "convirtio", "crea", "creo", "decide",
+        "descubre", "disena", "ensena", "enseno", "entrega", "instala", "instalo",
+        "investiga", "organiza", "organizo", "planta", "prueba", "recolecta",
+        "recolecto", "recupera", "recupero", "repara", "reparo", "rescata",
+        "transforma", "transformo", "vende", "visita", "builds", "creates",
+        "helps", "opens", "repairs", "rescues", "tests", "transforms",
+    }
+    protagonist_terms = {
+        "abuela", "abuelo", "adolescente", "agricultor", "artesana", "artesano",
+        "bombera", "bombero", "cientifica", "cientifico", "cocinera", "cocinero",
+        "docente", "enfermera", "enfermero", "estudiante", "familia", "hermana",
+        "hermano", "hombre", "ingeniera", "ingeniero", "joven", "madre", "maestra",
+        "maestro", "medica", "medico", "mujer", "nina", "nino", "padre",
+        "panadera", "panadero", "persona", "vecina", "vecino", "voluntaria",
+        "voluntario", "woman", "man", "student", "teacher", "family",
+    }
+    obstacle_markers = {
+        "aunque", "pero", "sin", "perdio", "fallo", "rechazo", "escasez",
+        "deuda", "lluvia", "incendio", "averia", "obstaculo", "problema",
+        "despues", "cuando", "inundacion", "superar", "supero", "tras",
+        "despite", "but", "failed", "lost", "problem",
+    }
+    result_markers = {
+        "logro", "consiguio", "finalmente", "resultado", "permitio", "mejoro",
+        "salvo", "reconstruyo", "recupero", "transformo", "termino", "ahora",
+        "ayudo", "construyo", "creo",
+        "became", "finally", "improved", "result", "saved", "succeeded",
+    }
+    concrete_context_terms = {
+        "biblioteca", "carta", "casa", "escuela", "estantes", "granja", "hospital",
+        "libros", "mercado", "moto", "panaderia", "puente", "ropa", "taller",
+        "tienda", "tren", "barrio", "comunidad", "library", "school", "workshop",
+    }
+    idea_tokens = _idea_tokens(subject)
+    dimensions = {
+        "protagonist": bool(set(tokens) & protagonist_terms),
+        "visible_action": bool(idea_tokens & action_terms),
+        "obstacle": bool(set(tokens) & obstacle_markers),
+        "result": bool(set(tokens) & result_markers),
+        "concrete_context": bool(set(tokens) & concrete_context_terms),
+        "specific_title": bool(title and len(normalize_idea_text(title).split()) >= 5),
     }
     if len(tokens) < 8:
         score -= 35
@@ -246,17 +287,55 @@ def audit_story_idea(subject: str, title: str = "") -> dict:
     if any(pattern in combined for pattern in unsupported_patterns):
         score -= 30
         issues.append("Contiene una afirmación sensacional difícil de sustentar")
-    if not (_idea_tokens(subject) & action_terms):
+    if not dimensions["protagonist"]:
+        score -= 12
+        issues.append(
+            "Protagonista impreciso: indica quién vive la historia y qué papel cumple"
+        )
+    else:
+        strengths.append("protagonista identificable")
+    if not dimensions["visible_action"]:
         score -= 15
-        issues.append("Falta una acción concreta del protagonista")
-    if title and len(normalize_idea_text(title).split()) < 5:
+        issues.append(
+            "Acción poco visible: añade un verbo filmable y el objeto sobre el que actúa"
+        )
+    else:
+        strengths.append("acción representable en video")
+    if not dimensions["obstacle"]:
+        score -= 12
+        issues.append(
+            "Conflicto incompleto: concreta qué dificultad, límite o revés impide el objetivo"
+        )
+    else:
+        strengths.append("obstáculo reconocible")
+    if not dimensions["result"]:
         score -= 10
-        issues.append("El título es poco específico")
+        issues.append(
+            "Cierre débil: explica el resultado observable de la decisión del protagonista"
+        )
+    else:
+        strengths.append("resultado verificable")
+    if not dimensions["concrete_context"]:
+        score -= 8
+        issues.append(
+            "Puesta en escena abstracta: agrega un lugar u objeto concreto que pueda mostrarse"
+        )
+    else:
+        strengths.append("contexto visual concreto")
+    if title and not dimensions["specific_title"]:
+        score -= 10
+        issues.append(
+            "Título poco específico: anticipa el conflicto o el objeto distintivo sin revelar el final"
+        )
+    elif dimensions["specific_title"]:
+        strengths.append("título suficientemente específico")
     score = max(0, min(score, 100))
     return {
         "score": score,
         "status": "approved" if score >= 60 else "review",
         "issues": issues,
+        "strengths": strengths,
+        "dimensions": dimensions,
     }
 
 

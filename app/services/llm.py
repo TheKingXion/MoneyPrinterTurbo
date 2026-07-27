@@ -1482,6 +1482,91 @@ Draft queries:
     return search_terms
 
 
+def generate_scene_blueprint(
+    video_subject: str,
+    video_script: str,
+    narration_segments: list[str],
+    base_queries: list[str],
+) -> list[dict]:
+    """Describe each timed narration segment as a strict, filmable stock scene."""
+    if not narration_segments:
+        return []
+    scene_inputs = [
+        {
+            "index": index,
+            "narration": narration,
+            "base_query": base_queries[
+                min(
+                    len(base_queries) - 1,
+                    index * len(base_queries) // len(narration_segments),
+                )
+            ]
+            if base_queries
+            else "",
+        }
+        for index, narration in enumerate(narration_segments)
+    ]
+    prompt = f"""
+# Role
+You are a film continuity editor preparing stock-footage scenes.
+
+# Task
+Return exactly {len(scene_inputs)} JSON objects, one for each input segment and in
+the same order. Return only the JSON array.
+
+# Object schema
+{{
+  "query": "5-9 English words describing one visible stock shot",
+  "fallback_queries": ["simpler literal English query"],
+  "action": "one concrete visible action",
+  "protagonist": "one canonical visible role; empty if absent",
+  "location": "literal location; empty if absent",
+  "required_objects": ["only objects explicitly supported by narration"],
+  "excluded_elements": ["likely but incorrect substitutions"],
+  "shot_type": "wide shot|medium shot|close-up",
+  "continuity_key": "stable protagonist/location/object signature"
+}}
+
+# Continuity rules
+- Keep the same exact protagonist descriptor across adjacent scenes.
+- Keep the same location until the script explicitly changes it.
+- Never invent age, gender, clothing, relatives, awards, crowds, celebrations or text.
+- Every scene needs a concrete visible action. Do not use abstract concepts.
+- Prefer footage that can realistically be found on Pexels, Pixabay or Coverr.
+- Preserve literal objects and locations from the narration.
+- Fallbacks may simplify composition but must preserve critical protagonist/action/object.
+
+# Subject
+{video_subject}
+
+# Full script
+{video_script}
+
+# Timed scene inputs
+{json.dumps(scene_inputs, ensure_ascii=False)}
+""".strip()
+    response = ""
+    for attempt in range(min(_max_retries + 1, 3)):
+        try:
+            with api_usage.usage_context("scene_blueprint", "generate_scene_blueprint"):
+                response = _generate_response(prompt)
+            parsed = json.loads(_strip_code_fence(response))
+            if (
+                isinstance(parsed, list)
+                and len(parsed) == len(narration_segments)
+                and all(isinstance(item, dict) for item in parsed)
+            ):
+                return parsed
+            logger.warning(
+                "scene blueprint returned an invalid scene count; using deterministic fallback"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"scene blueprint generation failed on attempt {attempt + 1}: {exc}"
+            )
+    return []
+
+
 # =============================================================================
 # Social publishing metadata
 #

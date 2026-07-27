@@ -60,6 +60,53 @@ class YouTubePanelStateTests(unittest.TestCase):
         )
         self.assertGreaterEqual(MAX_BATCH_IDEAS, 200)
 
+    def test_large_idea_generation_reduces_chunk_after_provider_failure(self):
+        requested = []
+        counter = 0
+
+        def generate(topic, amount, language, existing):
+            nonlocal counter
+            requested.append(amount)
+            if amount > 6:
+                raise RuntimeError("response was truncated")
+            rows = []
+            for _ in range(amount):
+                counter += 1
+                rows.append(
+                    {
+                        "subject": f"Historia concreta adaptable {counter}",
+                        "title_override": f"Titulo adaptable numero {counter}",
+                    }
+                )
+            return rows
+
+        def unique(subjects, existing):
+            return [
+                {
+                    "subject": subject,
+                    "duplicate": False,
+                    "duplicate_of": "",
+                    "similarity": 0.0,
+                }
+                for subject in subjects
+            ]
+
+        with (
+            patch(
+                "webui.components.youtube_panel.llm.generate_batch_ideas",
+                side_effect=generate,
+            ),
+            patch(
+                "webui.components.youtube_panel.validate_unique_ideas",
+                side_effect=unique,
+            ),
+        ):
+            rows = _generate_unique_idea_rows("tema", 14, "es", [])
+
+        self.assertEqual(len(rows), 14)
+        self.assertEqual(requested[:2], [12, 6])
+        self.assertTrue(all(amount <= 7 for amount in requested[1:]))
+
     def test_regeneration_preserves_only_locked_perfect_rows(self):
         perfect = {
             "subject": "Una joven construyo una biblioteca comunitaria tras superar una inundacion y ayudo a sus vecinos con libros recuperados",

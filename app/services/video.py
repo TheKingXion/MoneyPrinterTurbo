@@ -819,6 +819,90 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     return clip
 
 
+def _combine_storyboard_with_ffmpeg(
+    output_file: str,
+    video_paths: List[str],
+    clip_starts: List[float],
+    clip_durations: List[float],
+    video_width: int,
+    video_height: int,
+    threads: int,
+    max_duration: float,
+) -> str:
+    """Trim, crop and concatenate a storyboard in one encoding pass."""
+    command = [utils.get_ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error"]
+    filters = []
+    concat_inputs = []
+    for index, (video_path, start, duration) in enumerate(
+        zip(video_paths, clip_starts, clip_durations)
+    ):
+        command.extend(
+            [
+                "-ss",
+                f"{max(0.0, float(start)):.3f}",
+                "-t",
+                f"{max(0.05, float(duration)):.3f}",
+                "-i",
+                video_path,
+            ]
+        )
+        filters.append(
+            f"[{index}:v]scale={video_width}:{video_height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={video_width}:{video_height},setsar=1,fps={fps},"
+            f"format=yuv420p,setpts=PTS-STARTPTS[v{index}]"
+        )
+        concat_inputs.append(f"[v{index}]")
+    filters.append(
+        f"{''.join(concat_inputs)}concat=n={len(video_paths)}:v=1:a=0[outv]"
+    )
+    command.extend(["-filter_complex", ";".join(filters), "-map", "[outv]", "-an"])
+
+    def run(codec: str, partial_file: str):
+        codec_command = [*command, "-c:v", codec]
+        preset = performance.encoder_preset(codec)
+        if preset:
+            codec_command.extend(["-preset", preset])
+        codec_command.extend(
+            [
+                "-threads",
+                str(max(1, int(threads or 2))),
+                "-t",
+                f"{max_duration:.3f}",
+                "-movflags",
+                "+faststart",
+                partial_file,
+            ]
+        )
+        result = subprocess.run(
+            codec_command, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout or "FFmpeg storyboard render failed").strip()
+            )
+        return codec
+
+    def write(partial_file: str):
+        codec = _get_effective_video_codec()
+        try:
+            return run(codec, partial_file)
+        except Exception as hardware_error:
+            if codec == _DEFAULT_VIDEO_CODEC:
+                raise
+            delete_files(partial_file)
+            fallback = run(_DEFAULT_VIDEO_CODEC, partial_file)
+            _disable_runtime_video_codec(codec, str(hardware_error))
+            return fallback
+
+    used_codec = _write_output_atomically(output_file, write)
+    logger.info(
+        f"rendered {len(video_paths)} storyboard scenes in one FFmpeg pass "
+        f"with codec={used_codec}"
+    )
+    return output_file
+
+
 def close_clip(clip):
     if clip is None:
         return
@@ -853,13 +937,13 @@ def delete_files(files: List[str] | str):
     if isinstance(files, str):
         files = [files]
 
-    for file in files:
+    for file in dict.fromkeys(file for file in files if file):
         try:
             os.remove(file)
         except FileNotFoundError:
-            pass
-        except Exception as e:
-            logger.debug(f"failed to delete file {file}: {str(e)}")
+            continue
+        except OSError as e:
+            logger.warning(f"failed to delete temporary file {file}: {str(e)}")
 
 
 def _resolve_bgm_file_path(song_dir: str, bgm_file: str) -> str:
@@ -929,6 +1013,8 @@ def combine_videos(
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
+    clip_durations: List[float] | None = None,
+    clip_starts: List[float] | None = None,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -951,12 +1037,37 @@ def combine_videos(
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
+    timed_storyboard = (
+        clip_durations is not None
+        and clip_starts is not None
+        and len(clip_durations) == len(video_paths)
+        and len(clip_starts) == len(video_paths)
+        and bool(video_paths)
+    )
+    if (
+        timed_storyboard
+        and str(video_fit_mode).strip().lower() == "cover"
+        and transition_value in (None, VideoTransitionMode.none.value)
+    ):
+        return _combine_storyboard_with_ffmpeg(
+            output_file=combined_video_path,
+            video_paths=video_paths,
+            clip_starts=clip_starts,
+            clip_durations=clip_durations,
+            video_width=video_width,
+            video_height=video_height,
+            threads=threads,
+            max_duration=audio_duration,
+        )
 
     processed_clips = []
     subclipped_items = []
     video_duration = 0
     sequential_offsets = {}
-    for video_path in video_paths:
+    timed_storyboard = (
+        clip_durations is not None and len(clip_durations) == len(video_paths)
+    )
+    for path_index, video_path in enumerate(video_paths):
         clip = _open_video_clip_quietly(video_path)
         try:
             clip_duration = clip.duration
@@ -964,14 +1075,25 @@ def combine_videos(
         finally:
             close_clip(clip)
         
-        start_time = 0
-        if video_concat_mode.value == VideoConcatMode.sequential.value:
+        start_time = (
+            max(0.0, float(clip_starts[path_index]))
+            if timed_storyboard
+            and clip_starts is not None
+            and len(clip_starts) == len(video_paths)
+            else 0
+        )
+        if not timed_storyboard and video_concat_mode.value == VideoConcatMode.sequential.value:
             start_time = sequential_offsets.get(video_path, 0)
             if start_time >= clip_duration:
                 start_time = 0
 
         while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)
+            requested_duration = (
+                max(0.05, float(clip_durations[path_index]))
+                if timed_storyboard
+                else max_clip_duration
+            )
+            end_time = min(start_time + requested_duration, clip_duration)
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
@@ -989,14 +1111,15 @@ def combine_videos(
                 )
 
             start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
+            if timed_storyboard or video_concat_mode.value == VideoConcatMode.sequential.value:
                 sequential_offsets[video_path] = end_time
                 break
 
-    subclipped_items = _prioritize_unique_source_clips(
-        subclipped_items=subclipped_items,
-        concat_mode=video_concat_mode,
-    )
+    if not timed_storyboard:
+        subclipped_items = _prioritize_unique_source_clips(
+            subclipped_items=subclipped_items,
+            concat_mode=video_concat_mode,
+        )
         
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
     
@@ -1058,8 +1181,13 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
+            duration_limit = (
+                float(clip_durations[i])
+                if timed_storyboard and i < len(clip_durations)
+                else max_clip_duration
+            )
+            if clip.duration > duration_limit:
+                clip = clip.subclipped(0, duration_limit)
                 
             # wirte clip to temp file
             _write_videofile_with_codec_fallback(

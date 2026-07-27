@@ -44,7 +44,10 @@ from app.services import cache_manager, llm, video, voice
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
-from app.services.local_jobs import JobAlreadyRunningError, local_job_runner
+from app.services.durable_generation_queue import (
+    JobAlreadyRunningError,
+    durable_generation_queue as local_job_runner,
+)
 from app.utils import upload as upload_utils
 from app.utils import utils
 from webui.components import social_metadata, tiktok_panel, youtube_panel
@@ -2239,6 +2242,13 @@ def _render_video_settings(panel, params):
                 on_change=sync_script_order_concat_mode,
             )
             config.app["match_materials_to_script"] = params.match_materials_to_script
+            st.checkbox(
+                tr("Review Materials Before Rendering"),
+                help=tr("Review Materials Before Rendering Help"),
+                key="review_materials_before_rendering",
+                disabled=not params.match_materials_to_script
+                or params.video_source == "local",
+            )
 
             # 视频转场模式
             video_transition_modes = [
@@ -2349,17 +2359,63 @@ def _render_video_settings(panel, params):
 
 
 def _render_voice_preview(params, friendly_names, selected_tts_server, voice_name):
-    """使用当前音色、音量和语速生成一段试听音频。"""
-    if not friendly_names or not st.button(
-        tr("Play Voice"),
-        key="play_voice_button",
-        icon=":material/graphic_eq:",
-    ):
+    """Preview a sample or cache the complete narration for generation."""
+    if not friendly_names:
         return
 
     if selected_tts_server == "chatterbox":
         _sync_chatterbox_config_from_session_state()
-    play_content = params.video_subject or params.video_script
+
+    full_script = (params.video_script or "").strip()
+    fingerprint_payload = {
+        "script": full_script,
+        "voice_name": params.voice_name,
+        "voice_rate": params.voice_rate,
+        "voice_volume": params.voice_volume,
+    }
+    full_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    cached_preview = st.session_state.get("reusable_voice_preview")
+    if (
+        full_script
+        and isinstance(cached_preview, dict)
+        and cached_preview.get("fingerprint") == full_fingerprint
+        and os.path.isfile(cached_preview.get("audio_file", ""))
+    ):
+        params.reusable_voice_audio_file = cached_preview["audio_file"]
+        subtitle_file = cached_preview.get("subtitle_file")
+        params.reusable_voice_subtitle_file = (
+            subtitle_file if subtitle_file and os.path.isfile(subtitle_file) else None
+        )
+        params.reusable_voice_fingerprint = full_fingerprint
+        st.audio(params.reusable_voice_audio_file)
+        st.caption(tr("Full narration is ready and will be reused during generation."))
+
+    preview_columns = st.columns(2) if full_script else [st.container()]
+    with preview_columns[0]:
+        sample_clicked = st.button(
+            tr("Play Voice"),
+            key="play_voice_button",
+            icon=":material/graphic_eq:",
+        )
+    full_clicked = False
+    if full_script:
+        with preview_columns[1]:
+            full_clicked = st.button(
+                tr("Preview Full Narration"),
+                key="preview_full_narration_button",
+                icon=":material/record_voice_over:",
+            )
+    if not sample_clicked and not full_clicked:
+        return
+
+    play_content = full_script if full_clicked else (params.video_subject or "")
     if not play_content:
         # ElevenLabs 音色缺少明确语言字段时，根据展示名称中的越南语字符
         # 选择试听文案，避免用不匹配的语言判断音色效果。
@@ -2375,25 +2431,24 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
             play_content = tr("Voice Example")
 
     with st.spinner(tr("Synthesizing Voice")):
-        temp_dir = utils.storage_dir("temp", create=True)
-        audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
+        if full_clicked:
+            preview_dir = utils.storage_dir(
+                os.path.join("temp", "voice-previews"), create=True
+            )
+            audio_file = os.path.join(preview_dir, f"{full_fingerprint}.mp3")
+            subtitle_file = os.path.join(preview_dir, f"{full_fingerprint}.srt")
+        else:
+            temp_dir = utils.storage_dir("temp", create=True)
+            audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
+            subtitle_file = ""
         logger.info(
             "generating voice preview: "
             f"voice={voice_name}, rate={params.voice_rate}, "
             f"volume={params.voice_volume}"
         )
-        with config.runtime_config_lock():
-            sub_maker = voice.tts(
-                text=play_content,
-                voice_name=voice_name,
-                voice_rate=params.voice_rate,
-                voice_file=audio_file,
-                voice_volume=params.voice_volume,
-            )
-            # 首次试听失败后仍在同一个配置锁中重试，避免两个请求之间
-            # 被其它标签页切换 TTS Provider 或 API Key。
-            if not sub_maker:
-                play_content = "This is an example voice."
+        sub_maker = None
+        if not (full_clicked and os.path.isfile(audio_file)):
+            with config.runtime_config_lock():
                 sub_maker = voice.tts(
                     text=play_content,
                     voice_name=voice_name,
@@ -2401,9 +2456,43 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                     voice_file=audio_file,
                     voice_volume=params.voice_volume,
                 )
+                # Only the short sample may fall back to generic text. A full
+                # preview must always represent the exact script fingerprint.
+                if not sub_maker and not full_clicked:
+                    play_content = "This is an example voice."
+                    sub_maker = voice.tts(
+                        text=play_content,
+                        voice_name=voice_name,
+                        voice_rate=params.voice_rate,
+                        voice_file=audio_file,
+                        voice_volume=params.voice_volume,
+                    )
 
-        if not sub_maker or not os.path.exists(audio_file):
+        if not os.path.exists(audio_file):
             return
+        if full_clicked and sub_maker:
+            try:
+                voice.create_subtitle(
+                    text=play_content,
+                    sub_maker=sub_maker,
+                    subtitle_file=subtitle_file,
+                )
+            except Exception as exc:
+                logger.warning(f"could not cache narration timeline: {exc}")
+        if full_clicked:
+            cached_subtitle = (
+                subtitle_file
+                if os.path.isfile(subtitle_file) and os.path.getsize(subtitle_file) > 0
+                else None
+            )
+            st.session_state["reusable_voice_preview"] = {
+                "fingerprint": full_fingerprint,
+                "audio_file": audio_file,
+                "subtitle_file": cached_subtitle,
+            }
+            params.reusable_voice_audio_file = audio_file
+            params.reusable_voice_subtitle_file = cached_subtitle
+            params.reusable_voice_fingerprint = full_fingerprint
         try:
             with open(audio_file, "rb") as file:
                 audio_bytes = file.read()
@@ -2416,7 +2505,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                 logger.error(f"voice preview audio file is empty: {audio_file}")
         finally:
             # 试听文件只服务当前 rerun，渲染为内存数据后立即清理。
-            if os.path.exists(audio_file):
+            if not full_clicked and os.path.exists(audio_file):
                 os.remove(audio_file)
 
 
@@ -3190,11 +3279,11 @@ def _render_subtitle_settings(panel, params):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
 
-def _run_generation_job(task_id, params):
+def _run_generation_job(task_id, params, stop_at="video"):
     """Run generation in a worker; this function must remain Streamlit-free."""
     logger.info(f"start generating video: task_id={task_id}")
     logger.info(utils.to_json(params))
-    return tm.start(task_id=task_id, params=params)
+    return tm.start(task_id=task_id, params=params, stop_at=stop_at)
 
 
 def _generation_session_id():
@@ -3217,6 +3306,168 @@ def _append_generation_logs(records):
         del stored[:-1000]
 
 
+def _render_storyboard_review(payload):
+    result = payload.get("result") or {}
+    storyboard = result.get("storyboard") or {}
+    scenes = storyboard.get("scenes") or []
+    if not scenes:
+        st.error(tr("Video Generation Failed"))
+        return
+    task_id = payload.get("task_id")
+    review_state = st.session_state.get("storyboard_review_state") or {}
+    review_params = review_state.get("params")
+    if review_params is not None:
+        # Scene replacement instructions are one-shot. Keeping them in the
+        # final render request would invalidate the freshly selected clip.
+        review_params.storyboard_scene_overrides = {}
+        review_params.locked_storyboard_scene_ids = []
+    st.subheader(tr("Material Storyboard"))
+    quality_report = result.get("quality_report") or {}
+    st.caption(
+        f"{tr('Coverage')}: {float(quality_report.get('coverage_ratio') or 0) * 100:.1f}% · "
+        f"{tr('Repeated Clips')}: {int(quality_report.get('duplicate_clip_count') or 0)}"
+    )
+    issues_by_scene = {}
+    for issue in quality_report.get("issues") or []:
+        issues_by_scene.setdefault(issue.get("scene_id"), []).append(issue.get("code"))
+
+    def approval_key_for(scene):
+        scene_id = str(
+            scene.get("scene_id") or f"scene-{scene.get('index', 0)}"
+        )
+        selected = scene.get("selected_clip") or {}
+        signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "path": selected.get("local_path"),
+                    "url": selected.get("url"),
+                    "start": selected.get("start_time"),
+                    "query": selected.get("search_term"),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()[:10]
+        return f"storyboard_approved_{task_id}_{scene_id}_{signature}"
+
+    approved = 0
+    for scene in scenes:
+        scene_id = str(scene.get("scene_id") or f"scene-{scene.get('index', 0)}")
+        selected = scene.get("selected_clip") or {}
+        with st.container(border=True):
+            st.caption(
+                f"{scene_id} · {float(scene.get('start', 0)):.1f}s–"
+                f"{float(scene.get('end', 0)):.1f}s · "
+                f"{tr('Fidelity Score')}: {float(scene.get('fidelity_score') or 0):.3f}"
+            )
+            st.write(scene.get("narration") or "")
+            replacement_query = st.text_input(
+                tr("Scene Search Query"),
+                value=scene.get("query") or "",
+                key=f"storyboard_query_{task_id}_{scene_id}",
+            )
+            local_path = selected.get("local_path")
+            if local_path and os.path.isfile(local_path):
+                start_time = float(selected.get("start_time") or 0)
+                duration = float(selected.get("duration") or 0)
+                st.video(
+                    local_path,
+                    start_time=start_time,
+                    end_time=start_time + duration if duration > 0 else None,
+                    muted=True,
+                )
+            else:
+                st.warning(tr("No Relevant Material Found"))
+            if scene.get("warnings"):
+                st.caption(", ".join(str(item) for item in scene["warnings"]))
+            if issues_by_scene.get(scene_id):
+                st.warning(", ".join(issues_by_scene[scene_id]))
+            approval_key = approval_key_for(scene)
+            if st.checkbox(
+                tr("Approve This Clip"),
+                key=approval_key,
+                disabled=not bool(local_path),
+            ):
+                approved += 1
+            if st.button(
+                tr("Search This Scene Again"),
+                key=f"replace_storyboard_scene_{task_id}_{scene_id}",
+                disabled=not replacement_query.strip()
+                or _current_generation_job() is not None,
+                icon=":material/find_replace:",
+            ):
+                review_state = st.session_state.get("storyboard_review_state") or {}
+                generation_params = copy.deepcopy(review_state.get("params"))
+                generation_config = copy.deepcopy(review_state.get("config"))
+                if generation_params is not None and generation_config is not None:
+                    locked_ids = []
+                    for other_scene in scenes:
+                        other_id = str(
+                            other_scene.get("scene_id")
+                            or f"scene-{other_scene.get('index', 0)}"
+                        )
+                        if (
+                            other_id != scene_id
+                            and st.session_state.get(
+                                approval_key_for(other_scene), False
+                            )
+                        ):
+                            locked_ids.append(other_id)
+                    generation_params.storyboard_scene_overrides = {
+                        scene_id: replacement_query.strip()
+                    }
+                    generation_params.locked_storyboard_scene_ids = locked_ids
+                    st.session_state["storyboard_review_state"]["params"] = (
+                        copy.deepcopy(generation_params)
+                    )
+                    local_job_runner.submit(
+                        _generation_session_id(),
+                        task_id,
+                        generation_params,
+                        config_snapshot=generation_config,
+                        stop_at="materials",
+                    )
+                    st.session_state["generation_job_id"] = task_id
+                    st.session_state.pop("last_generation_result", None)
+                    st.rerun(scope="fragment")
+    st.info(
+        tr("Approved Clips Count").format(approved=approved, total=len(scenes))
+    )
+    review_state = st.session_state.get("storyboard_review_state") or {}
+    can_continue = (
+        approved == len(scenes)
+        and review_state.get("task_id") == task_id
+        and _current_generation_job() is None
+    )
+    if st.button(
+        tr("Generate Video"),
+        type="primary",
+        width="stretch",
+        key=f"render_approved_storyboard_{task_id}",
+        disabled=not can_continue,
+    ):
+        generation_params = copy.deepcopy(review_state["params"])
+        generation_config = copy.deepcopy(review_state["config"])
+        _add_active_generation_task(
+            task_id,
+            subject=generation_params.video_subject
+            or generation_params.video_script
+            or task_id,
+        )
+        local_job_runner.submit(
+            _generation_session_id(),
+            task_id,
+            generation_params,
+            config_snapshot=generation_config,
+            stop_at="video",
+        )
+        st.session_state["generation_job_id"] = task_id
+        st.session_state.pop("last_generation_result", None)
+        st.rerun(scope="fragment")
+    elif approved != len(scenes):
+        st.caption(tr("Please Prepare and Approve All Storyboard Clips"))
+
+
 def _render_generation_result(payload):
     if not payload:
         return
@@ -3225,6 +3476,9 @@ def _render_generation_result(payload):
         return
 
     result = payload.get("result")
+    if result and "storyboard" in result and "videos" not in result:
+        _render_storyboard_review(payload)
+        return
     if not result or "videos" not in result:
         st.error(tr("Video Generation Failed"))
         return
@@ -3266,7 +3520,12 @@ def _render_generation_progress():
             st.session_state.pop("generation_job_id", None)
             _remove_active_generation_task(job.job_id)
             local_job_runner.discard(session_id, job.job_id)
-            if not payload.get("error") and payload.get("result"):
+            if (
+                not payload.get("error")
+                and payload.get("result")
+                and "videos" in payload["result"]
+            ):
+                st.session_state.pop("storyboard_review_state", None)
                 if _should_open_task_folder(
                     config.listen_host, config.is_running_in_container()
                 ):
@@ -3489,11 +3748,26 @@ def _render_generation_controls(
                 generation_params = copy.deepcopy(params)
                 generation_config = config.snapshot_runtime_config()
 
+            review_storyboard = bool(
+                st.session_state.get("review_materials_before_rendering")
+                and generation_params.match_materials_to_script
+                and generation_params.video_source != "local"
+            )
+            generation_stop_at = "materials" if review_storyboard else "video"
+            if review_storyboard:
+                st.session_state["storyboard_review_state"] = {
+                    "task_id": task_id,
+                    "params": copy.deepcopy(generation_params),
+                    "config": copy.deepcopy(generation_config),
+                }
+            else:
+                st.session_state.pop("storyboard_review_state", None)
             local_job_runner.submit(
                 _generation_session_id(),
                 task_id,
-                lambda: _run_generation_job(task_id, generation_params),
+                generation_params,
                 config_snapshot=generation_config,
+                stop_at=generation_stop_at,
             )
             st.session_state["generation_job_id"] = task_id
         except JobAlreadyRunningError:

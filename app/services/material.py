@@ -1,12 +1,16 @@
 import math
+import json
+import inspect
 import os
 import random
 import threading
+import tempfile
 import time
 import weakref
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
 import requests
 from loguru import logger
@@ -14,7 +18,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
-from app.services import clip_ranker
+from app.services import clip_ranker, material_cache
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -22,6 +26,119 @@ _api_key_counter = 0
 _api_key_lock = threading.Lock()
 _download_locks_guard = threading.Lock()
 _download_locks = weakref.WeakValueDictionary()
+
+
+def _redact_secret(message: object, secret: object) -> str:
+    safe_message = str(message)
+    secret_value = str(secret or "")
+    if not secret_value:
+        return safe_message
+    safe_message = safe_message.replace(secret_value, "***")
+    encoded_secret = quote_plus(secret_value)
+    if encoded_secret != secret_value:
+        safe_message = safe_message.replace(encoded_secret, "***")
+    return safe_message
+
+
+def _redact_request_error(error: object, *secrets: object) -> str:
+    message = str(error)
+    for secret in secrets:
+        message = _redact_secret(message, secret)
+    for proxy_url in config.proxy.values():
+        message = _redact_secret(message, proxy_url)
+    return message
+
+
+def _is_cloudflare_challenge(response: requests.Response) -> bool:
+    headers = getattr(response, "headers", {}) or {}
+    if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+    if "text/html" not in str(headers.get("content-type", "")).lower():
+        return False
+    body = str(getattr(response, "text", "")).lower()
+    return "just a moment" in body or "/cdn-cgi/challenge-platform/" in body
+
+
+def _source_info(
+    provider: str,
+    *,
+    asset_id: object = None,
+    source_page: object = None,
+    creator_name: object = None,
+    creator_page: object = None,
+    width: object = None,
+    height: object = None,
+) -> dict:
+    result: dict[str, object] = {"provider": provider}
+    if asset_id not in (None, ""):
+        result["asset_id"] = str(asset_id)
+    safe_source_page = material_cache.safe_public_url(source_page)
+    safe_creator_page = material_cache.safe_public_url(creator_page)
+    if safe_source_page:
+        result["source_page"] = safe_source_page
+    if safe_creator_page:
+        result["creator_page"] = safe_creator_page
+    if creator_name not in (None, ""):
+        result["creator_name"] = str(creator_name)
+    if width not in (None, ""):
+        result["width"] = width
+    if height not in (None, ""):
+        result["height"] = height
+    return result
+
+
+def _material_record(item: MaterialInfo, local_path: str) -> dict:
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    return {
+        "scene_index": int(item.scene_index),
+        "search_term": item.search_term,
+        "provider": item.provider,
+        "score": float(item.score),
+        "local_file": Path(local_path).name,
+        "asset_id": source.get("asset_id"),
+        "source_page": material_cache.safe_public_url(source.get("source_page")),
+        "creator_name": source.get("creator_name"),
+        "creator_page": material_cache.safe_public_url(source.get("creator_page")),
+        "width": source.get("width"),
+        "height": source.get("height"),
+    }
+
+
+def _persist_material_records(task_id: str, records: list[dict]) -> str | None:
+    if not records:
+        return None
+    target = Path(utils.task_dir(task_id)) / "materials.json"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=".materials.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(
+                {"version": 1, "materials": records},
+                temp_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, target)
+        return str(target)
+    except Exception as exc:
+        logger.warning(f"failed to persist material provenance: task_id={task_id}, error={exc}")
+        return None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @contextmanager
@@ -149,6 +266,16 @@ def search_videos_pexels(
                     item.duration = duration
                     item.thumbnail_url = str(v.get("image") or "")
                     item.search_term = search_term
+                    user = v.get("user") if isinstance(v.get("user"), dict) else {}
+                    item.source_info = _source_info(
+                        "pexels",
+                        asset_id=v.get("id"),
+                        source_page=v.get("url"),
+                        creator_name=user.get("name"),
+                        creator_page=user.get("url"),
+                        width=w,
+                        height=h,
+                    )
                     video_items.append(item)
                     break
         return video_items
@@ -182,7 +309,35 @@ def search_videos_pixabay(
         r = requests.get(
             query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
         )
-        response = r.json()
+        status_code = int(getattr(r, "status_code", 200))
+        headers = getattr(r, "headers", {}) or {}
+        content_type = str(headers.get("content-type", ""))
+        if _is_cloudflare_challenge(r):
+            logger.error(
+                "pixabay search blocked by Cloudflare challenge: "
+                f"status={status_code}, cf_ray={headers.get('cf-ray') or 'unknown'}"
+            )
+            return []
+        if status_code == 429:
+            logger.error(
+                "pixabay API rate limit exceeded: "
+                f"retry_after={headers.get('retry-after') or 'unknown'}"
+            )
+            return []
+        if status_code >= 400:
+            logger.error(
+                f"pixabay search failed: status={status_code}, "
+                f"content_type={content_type or 'unknown'}"
+            )
+            return []
+        try:
+            response = r.json()
+        except ValueError:
+            logger.error(
+                "pixabay returned a non-JSON response: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
         video_items = []
         if "hits" not in response:
             logger.error(f"search videos failed: {response}")
@@ -207,11 +362,27 @@ def search_videos_pixabay(
                     item.duration = duration
                     item.thumbnail_url = str(video.get("thumbnail") or "")
                     item.search_term = search_term
+                    item.source_info = _source_info(
+                        "pixabay",
+                        asset_id=v.get("id"),
+                        source_page=v.get("pageURL"),
+                        creator_name=v.get("user"),
+                        creator_page=(
+                            f"https://pixabay.com/users/{v.get('user')}-{v.get('user_id')}/"
+                            if v.get("user") and v.get("user_id")
+                            else None
+                        ),
+                        width=w,
+                        height=video.get("height"),
+                    )
                     video_items.append(item)
                     break
         return video_items
     except Exception as e:
-        logger.error(f"search videos failed: {str(e)}")
+        logger.error(
+            "pixabay search request failed: "
+            f"error={type(e).__name__}, detail={_redact_request_error(e, api_key)}"
+        )
 
     return []
 
@@ -291,6 +462,15 @@ def search_videos_coverr(
                 or ""
             )
             item.search_term = search_term
+            item.source_info = _source_info(
+                "coverr",
+                asset_id=video_id,
+                source_page=v.get("url"),
+                creator_name=v.get("author_name"),
+                creator_page=v.get("author_url"),
+                width=v.get("width"),
+                height=v.get("height"),
+            )
             video_items.append(item)
         return video_items
     except Exception as e:
@@ -399,6 +579,42 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+def _search_with_cache(
+    provider: str,
+    search_function,
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+) -> List[MaterialInfo]:
+    if not inspect.isfunction(search_function) or search_function.__module__ != __name__:
+        return search_function(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+    cache_args = {
+        "provider": provider,
+        "search_term": search_term,
+        "minimum_duration": minimum_duration,
+        "video_aspect": video_aspect,
+    }
+    cached = material_cache.load_search_results(**cache_args)
+    if cached is not None:
+        return cached
+    with material_cache.get_search_lock(**cache_args):
+        cached = material_cache.load_search_results(**cache_args)
+        if cached is not None:
+            return cached
+        items = search_function(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+        if items:
+            material_cache.save_search_results(**cache_args, items=items)
+        return items
+
+
 def search_scene_candidates(
     scene: dict,
     sources: List[str],
@@ -418,7 +634,9 @@ def search_scene_candidates(
         if len(accepted) >= limit:
             break
         try:
-            raw = search_functions[source_name](
+            raw = _search_with_cache(
+                provider=source_name,
+                search_function=search_functions[source_name],
                 search_term=scene["query"],
                 minimum_duration=minimum_duration,
                 video_aspect=video_aspect,
@@ -451,7 +669,9 @@ def search_scene_candidates(
         relaxed = []
         for source_name in ordered_sources:
             try:
-                raw = search_functions[source_name](
+                raw = _search_with_cache(
+                    provider=source_name,
+                    search_function=search_functions[source_name],
                     search_term=relaxed_query,
                     minimum_duration=minimum_duration,
                     video_aspect=video_aspect,
@@ -552,6 +772,7 @@ def download_videos(
         f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
     )
     video_paths = []
+    material_records: list[dict] = []
 
     concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
     if concat_mode_value == VideoConcatMode.random.value:
@@ -560,13 +781,18 @@ def download_videos(
     total_duration = 0.0
     for item in valid_video_items:
         try:
-            logger.info(f"downloading video: {item.url}")
+            source_info = item.source_info if isinstance(item.source_info, dict) else {}
+            logger.info(
+                f"downloading {item.provider} video: "
+                f"asset_id={source_info.get('asset_id') or 'unknown'}"
+            )
             saved_video_path = save_video(
                 video_url=item.url, save_dir=material_directory
             )
             if saved_video_path:
                 logger.info(f"video saved: {saved_video_path}")
                 video_paths.append(saved_video_path)
+                material_records.append(_material_record(item, saved_video_path))
                 seconds = min(max_clip_duration, item.duration)
                 total_duration += seconds
                 if total_duration > audio_duration:
@@ -575,8 +801,154 @@ def download_videos(
                     )
                     break
         except Exception as e:
-            logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
+            logger.error(
+                f"failed to download {item.provider} video: "
+                f"{type(e).__name__}: {_redact_request_error(e, item.url)}"
+            )
     logger.success(f"downloaded {len(video_paths)} videos")
+    _persist_material_records(task_id, material_records)
+    return video_paths
+
+
+def download_storyboard_videos(
+    task_id: str,
+    scenes,
+    sources: List[str],
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[str]:
+    """Select and download one traceable stock clip for every timed scene."""
+    video_paths: list[str] = []
+    material_records: list[dict] = []
+    used_urls: set[str] = set()
+    previous_selection: tuple[str, MaterialInfo, float] | None = None
+    material_directory = config.app.get("material_directory", "").strip()
+    if material_directory == "task":
+        material_directory = utils.task_dir(task_id)
+    elif material_directory and not os.path.isdir(material_directory):
+        material_directory = ""
+
+    for scene in scenes:
+        locked_selection = scene.selected_clip or {}
+        locked_path = locked_selection.get("local_path", "")
+        if getattr(scene, "locked", False) and os.path.isfile(locked_path):
+            video_paths.append(locked_path)
+            source_info = locked_selection.get("source_info") or {}
+            material_records.append(
+                {
+                    "provider": locked_selection.get("provider", "cached"),
+                    "resource_id": source_info.get("resource_id"),
+                    "public_page": source_info.get("public_page"),
+                    "author": source_info.get("author"),
+                    "resolution": source_info.get("resolution"),
+                    "query": locked_selection.get("search_term") or scene.query,
+                    "local_path": locked_path,
+                }
+            )
+            locked_url = locked_selection.get("url")
+            if locked_url:
+                used_urls.add(locked_url)
+            continue
+
+        queries = [scene.query, *getattr(scene, "fallback_queries", [])]
+        candidates: list[MaterialInfo] = []
+        selected_query = scene.query
+        for query in dict.fromkeys(value for value in queries if value):
+            candidates = search_scene_candidates(
+                scene={
+                    "index": scene.index,
+                    "query": query,
+                    "required_objects": scene.required_objects,
+                    "excluded_elements": scene.excluded_elements,
+                },
+                sources=sources,
+                video_aspect=video_aspect,
+                minimum_duration=max(1, math.ceil(scene.duration)),
+                limit=4,
+            )
+            if candidates:
+                selected_query = query
+                break
+
+        candidates = sorted(
+            candidates,
+            key=lambda item: (item.url in used_urls, -float(item.score)),
+        )
+        candidate = candidates[0] if candidates else None
+        start_time = 0.0
+        if candidate is None:
+            if previous_selection is None:
+                scene.warnings.append("no_material_found")
+                logger.error(f"no material found for storyboard scene {scene.scene_id}")
+                continue
+            saved_path, candidate, start_time = previous_selection
+            scene.warnings.extend(["no_material_found", "reused_previous_clip"])
+        else:
+            analyzed = []
+            candidate_limit = min(
+                3,
+                max(1, int(config.app.get("actual_frame_candidates", 2) or 2)),
+            )
+            for frame_candidate in candidates[:candidate_limit]:
+                try:
+                    frame_path = save_video(
+                        frame_candidate.url, save_dir=material_directory
+                    )
+                    if not frame_path:
+                        continue
+                    frame_start, frame_score = clip_ranker.find_best_video_window(
+                        video_path=frame_path,
+                        query=selected_query,
+                        window_duration=scene.duration,
+                        required_objects=scene.required_objects,
+                        excluded_elements=scene.excluded_elements,
+                    )
+                    analyzed.append(
+                        (
+                            float(frame_score or frame_candidate.score),
+                            frame_start,
+                            frame_path,
+                            frame_candidate,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"storyboard frame analysis failed: scene={scene.scene_id}, "
+                        f"provider={frame_candidate.provider}, "
+                        f"error={_redact_request_error(exc, frame_candidate.url)}"
+                    )
+            if analyzed:
+                actual_score, start_time, saved_path, candidate = max(
+                    analyzed, key=lambda item: item[0]
+                )
+                candidate.score = actual_score
+            else:
+                if previous_selection is None:
+                    scene.warnings.append("download_failed")
+                    continue
+                saved_path, candidate, start_time = previous_selection
+                scene.warnings.append("reused_previous_clip")
+
+        candidate.scene_index = scene.index
+        candidate.search_term = selected_query
+        if candidate.url in used_urls:
+            scene.warnings.append("repeated_clip")
+        used_urls.add(candidate.url)
+        scene.fidelity_score = float(candidate.score)
+        scene.selected_clip = {
+            "local_path": saved_path,
+            "url": candidate.url,
+            "provider": candidate.provider,
+            "search_term": selected_query,
+            "score": float(candidate.score),
+            "start_time": round(float(start_time), 3),
+            "duration": round(float(scene.duration), 3),
+            "source_info": candidate.source_info or {},
+        }
+        video_paths.append(saved_path)
+        material_records.append(_material_record(candidate, saved_path))
+        previous_selection = (saved_path, candidate, start_time)
+
+    _persist_material_records(task_id, material_records)
     return video_paths
 
 
@@ -628,6 +1000,7 @@ def _download_videos_by_script_order(
     )
 
     video_paths = []
+    material_records: list[dict] = []
     total_duration = 0.0
     group_count = max(len(candidate_groups), 1)
     required_clip_count = max(1, math.ceil(audio_duration / max(max_clip_duration, 1)))
@@ -647,8 +1020,12 @@ def _download_videos_by_script_order(
             if downloaded_for_term >= target_clip_count:
                 break
             try:
+                source_info = (
+                    item.source_info if isinstance(item.source_info, dict) else {}
+                )
                 logger.info(
-                    f"downloading ordered video for '{search_term}': {item.url}"
+                    f"downloading ordered {item.provider} video for {search_term!r}: "
+                    f"asset_id={source_info.get('asset_id') or 'unknown'}"
                 )
                 saved_video_path = save_video(
                     video_url=item.url, save_dir=material_directory
@@ -656,13 +1033,15 @@ def _download_videos_by_script_order(
                 if saved_video_path:
                     logger.info(f"video saved: {saved_video_path}")
                     video_paths.append(saved_video_path)
+                    material_records.append(_material_record(item, saved_video_path))
                     clip_duration = min(max_clip_duration, item.duration)
                     term_duration += clip_duration
                     total_duration += clip_duration
                     downloaded_for_term += 1
             except Exception as e:
                 logger.error(
-                    f"failed to download ordered video: {utils.to_json(item)} => {str(e)}"
+                    f"failed to download ordered {item.provider} video: "
+                    f"{type(e).__name__}: {_redact_request_error(e, item.url)}"
                 )
 
         logger.info(
@@ -671,6 +1050,7 @@ def _download_videos_by_script_order(
         )
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")
+    _persist_material_records(task_id, material_records)
     return video_paths
 
 

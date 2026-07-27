@@ -8,6 +8,7 @@ import numpy as np
 import requests
 from loguru import logger
 from PIL import Image
+from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo
@@ -304,3 +305,71 @@ def rank_materials(
     )
     accepted = [item for item in ranked if item.score >= minimum]
     return accepted[: max(1, limit)]
+
+
+def find_best_video_window(
+    video_path: str,
+    query: str,
+    window_duration: float,
+    required_objects: Iterable[str] | None = None,
+    excluded_elements: Iterable[str] | None = None,
+) -> tuple[float, float]:
+    """Score decoded frames and return the most relevant temporal window."""
+    clip = None
+    try:
+        clip = VideoFileClip(video_path, audio=False)
+        duration = float(clip.duration or 0)
+        if duration <= 0:
+            return 0.0, 0.0
+        window = min(max(0.5, float(window_duration)), duration)
+        latest_start = max(0.0, duration - window)
+        starts = np.linspace(0.0, latest_start, num=min(8, max(1, int(latest_start) + 1)))
+        sample_times = []
+        owners = []
+        for window_index, start in enumerate(starts):
+            for fraction in (0.15, 0.5, 0.85):
+                sample_times.append(min(duration - 0.01, start + window * fraction))
+                owners.append(window_index)
+        images = [
+            Image.fromarray(clip.get_frame(float(sample_time))).convert("RGB")
+            for sample_time in sample_times
+        ]
+        required = ", ".join(required_objects or [])
+        positive = f"a stock video frame showing {query}"
+        if required:
+            positive += f", clearly including {required}"
+        labels = [positive, "an unrelated generic stock video"]
+        labels.extend(_query_negatives(query)[:5])
+        labels.extend(
+            f"a frame showing {value}"
+            for value in (excluded_elements or [])
+            if value
+        )
+        model, processor = _load_clip()
+        inputs = processor(text=labels, images=images, return_tensors="np", padding=True)
+        outputs = model(**inputs)
+        similarities = np.asarray(outputs.image_embeds) @ np.asarray(
+            outputs.text_embeds
+        ).T
+        positive_scores = similarities[:, 0]
+        negative_scores = np.max(similarities[:, 1:], axis=1)
+        margins = positive_scores - negative_scores
+        window_scores = []
+        for window_index in range(len(starts)):
+            indices = [
+                index for index, owner in enumerate(owners) if owner == window_index
+            ]
+            relevance = float(np.mean(positive_scores[indices]))
+            margin = float(np.mean(margins[indices]))
+            window_scores.append(relevance + max(-0.1, margin) * 0.25)
+        best_index = int(np.argmax(window_scores))
+        return float(starts[best_index]), float(window_scores[best_index])
+    except Exception as exc:
+        logger.warning(f"actual video-frame analysis failed: {exc}")
+        return 0.0, 0.0
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception:
+                pass

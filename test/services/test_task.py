@@ -157,6 +157,43 @@ class TestTaskService(unittest.TestCase):
         self.assertIsNone(sub_maker)
         tts.assert_not_called()
 
+    def test_generate_audio_reuses_full_narration_preview(self):
+        script = "A complete narration."
+        params = VideoParams(
+            video_subject="preview",
+            video_script=script,
+            voice_name="test-voice",
+            voice_rate=1.1,
+            voice_volume=0.8,
+        )
+        params.reusable_voice_fingerprint = tm._voice_preview_fingerprint(
+            params, script
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "preview.mp3")
+            Path(source).write_bytes(b"cached narration")
+            params.reusable_voice_audio_file = source
+            with (
+                patch.object(tm.utils, "task_dir", return_value=directory),
+                patch.object(
+                    tm,
+                    "_resolve_reusable_voice_file",
+                    return_value=source,
+                ),
+                patch.object(tm.voice, "tts") as tts,
+                patch.object(tm.voice, "get_audio_duration", return_value=12.5),
+            ):
+                audio_file, audio_duration, sub_maker = tm.generate_audio(
+                    "task-id", params, script
+                )
+
+            self.assertEqual(Path(audio_file).read_bytes(), b"cached narration")
+
+        self.assertEqual(audio_duration, 12.5)
+        self.assertIsNone(sub_maker)
+        tts.assert_not_called()
+
     def test_generate_audio_accepts_server_side_custom_file(self):
         task_id = "test-custom-audio-server-side"
         task_dir = utils.task_dir(task_id)

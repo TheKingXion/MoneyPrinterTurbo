@@ -262,13 +262,31 @@ def _score_idea_rows(rows: list[dict]) -> list[dict]:
 def _generate_unique_idea_rows(topic: str, total: int, language: str, existing: list[str]) -> list[dict]:
     accepted = []
     blocked = list(existing)
-    maximum_calls = max(3, ((max(0, total) + IDEA_GENERATION_CHUNK_SIZE - 1) // IDEA_GENERATION_CHUNK_SIZE) * 3)
+    maximum_calls = max(
+        3,
+        (
+            (max(0, total) + IDEA_GENERATION_CHUNK_SIZE - 1)
+            // IDEA_GENERATION_CHUNK_SIZE
+        )
+        * 4,
+    )
+    adaptive_chunk_size = IDEA_GENERATION_CHUNK_SIZE
+    last_error = ""
     for _ in range(maximum_calls):
         missing = total - len(accepted)
         if missing <= 0:
             break
-        requested = min(missing, IDEA_GENERATION_CHUNK_SIZE)
-        generated = llm.generate_batch_ideas(topic, requested, language, blocked)
+        requested = min(missing, adaptive_chunk_size)
+        try:
+            generated = llm.generate_batch_ideas(
+                topic, requested, language, blocked
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if adaptive_chunk_size > 1:
+                adaptive_chunk_size = max(1, adaptive_chunk_size // 2)
+                continue
+            raise
         audit = validate_unique_ideas(
             [row.get("subject", "") for row in generated],
             blocked,
@@ -284,8 +302,15 @@ def _generate_unique_idea_rows(topic: str, total: int, language: str, existing: 
                 }
             )
             blocked.append(result["subject"])
+        if generated:
+            adaptive_chunk_size = min(
+                IDEA_GENERATION_CHUNK_SIZE, adaptive_chunk_size + 1
+            )
     if len(accepted) != total:
-        raise RuntimeError("Unable to prepare the requested number of unique ideas")
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(
+            f"Unable to prepare the requested number of unique ideas{detail}"
+        )
     return _score_idea_rows(accepted)
 
 

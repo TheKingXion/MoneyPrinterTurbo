@@ -633,5 +633,34 @@ class TestReviewedMaterialWorkflow(unittest.TestCase):
             "person securing data smartphone",
         )
 
+    def test_locked_storyboard_scene_reuses_selected_file_without_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clip_path = os.path.join(directory, "approved.mp4")
+            Path(clip_path).write_bytes(b"approved")
+            scene = SimpleNamespace(
+                scene_id="scene-001",
+                index=0,
+                query="person opening letter",
+                selected_clip={
+                    "local_path": clip_path,
+                    "url": "https://example.com/approved.mp4",
+                    "provider": "pexels",
+                    "search_term": "person opening letter",
+                    "source_info": {},
+                },
+                locked=True,
+            )
+            with (
+                patch.object(material, "search_scene_candidates") as search,
+                patch.object(material, "_persist_material_records") as persist,
+            ):
+                result = material.download_storyboard_videos(
+                    "task-id", [scene], ["pexels"]
+                )
+
+        self.assertEqual(result, [clip_path])
+        search.assert_not_called()
+        persist.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()

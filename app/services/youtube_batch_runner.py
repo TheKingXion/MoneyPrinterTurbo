@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from app.models.schema import VideoParams
 from app.services import state as sm
-from app.services import task as tm
 from app.services.youtube_batch import YouTubeBatchStore, youtube_batch_store
 
 GenerateFunction = Callable[[str, VideoParams], Any]
@@ -28,12 +27,31 @@ def classify_upload_failure(error: Any) -> str:
 
 
 def _default_generate(task_id: str, params: VideoParams) -> Any:
-    return tm.start(
-        task_id=task_id,
-        params=params,
-        suppress_youtube_upload=True,
-        suppress_tiktok_upload=True,
+    # Import lazily so API-only processes do not start local workers unless a
+    # managed YouTube campaign actually needs them.
+    from app.config import config
+    from app.services.durable_generation_queue import durable_generation_queue
+
+    campaign_id = getattr(params, "generation_campaign_id", None)
+    session_id = f"youtube-batch:{campaign_id or task_id}"
+    params = params.model_copy(
+        update={
+            "suppress_youtube_upload": True,
+            "suppress_tiktok_upload": True,
+        },
+        deep=True,
     )
+    with config.runtime_config_lock():
+        snapshot = config.snapshot_runtime_config()
+    job = durable_generation_queue.submit(
+        session_id,
+        task_id,
+        params,
+        config_snapshot=snapshot,
+        stop_at="video",
+        campaign_id=campaign_id,
+    )
+    return job.result()
 
 
 def _default_upload(item: dict, slot: dict, settings: dict) -> dict:
@@ -244,6 +262,7 @@ class YouTubeBatchRunner:
         raw_params = dict(settings.get("video_params", {}))
         raw_params["video_subject"] = item["subject"]
         raw_params["video_count"] = 1
+        raw_params["generation_campaign_id"] = batch_id
         try:
             params = VideoParams(**raw_params)
             result = self.generate(task_id, params)

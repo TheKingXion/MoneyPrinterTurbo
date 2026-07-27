@@ -59,6 +59,7 @@ class MaterialInfo:
     search_term: str = ""
     score: float = 0.0
     scene_index: int = -1
+    source_info: Optional[dict[str, Any]] = None
 
 
 class VideoParams(BaseModel):
@@ -95,6 +96,16 @@ class VideoParams(BaseModel):
     )
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    # Internal WebUI cache produced by the full narration preview. The task
+    # service validates both paths and the fingerprint before reusing them.
+    reusable_voice_audio_file: Optional[str] = None
+    reusable_voice_subtitle_file: Optional[str] = None
+    reusable_voice_fingerprint: Optional[str] = None
+    storyboard_scene_overrides: dict[str, str] = Field(default_factory=dict)
+    locked_storyboard_scene_ids: List[str] = Field(default_factory=list)
+    generation_campaign_id: Optional[str] = None
+    suppress_youtube_upload: bool = False
+    suppress_tiktok_upload: bool = False
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""

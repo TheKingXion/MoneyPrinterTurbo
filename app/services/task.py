@@ -1,6 +1,9 @@
+import hashlib
+import json
 import math
 import os.path
 import re
+import shutil
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -12,7 +15,19 @@ from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
-from app.services import llm, material, performance, sonilo, subtitle, twelvelabs, video, voice, upload_post
+from app.services import (
+    llm,
+    material,
+    performance,
+    sonilo,
+    subtitle,
+    twelvelabs,
+    video,
+    video_quality,
+    video_storyboard,
+    voice,
+    upload_post,
+)
 from app.services import state as sm
 from app.services.task_manifest import TaskManifest, hash_file
 from app.services.youtube_uploader import upload_tracker, youtube_uploader
@@ -163,6 +178,7 @@ def _audio_cache_inputs(params, video_script):
         "video_script": video_script,
         "voice_name": params.voice_name,
         "voice_rate": params.voice_rate,
+        "voice_volume": params.voice_volume,
     }
 
 
@@ -188,6 +204,32 @@ def _restore_cached_stage(manifest, stage, inputs):
     except Exception as exc:
         logger.warning(f"failed to read task cache stage {stage}: {exc}")
         return None
+
+
+def _voice_preview_fingerprint(params, video_script):
+    payload = {
+        "script": video_script,
+        "voice_name": getattr(params, "voice_name", ""),
+        "voice_rate": getattr(params, "voice_rate", 1.0),
+        "voice_volume": getattr(params, "voice_volume", 1.0),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_reusable_voice_file(requested_file, expected_suffix):
+    if not requested_file:
+        return None
+    resolved = file_security.resolve_path_within_directory(
+        utils.storage_dir("temp", create=True), requested_file
+    )
+    if path.splitext(resolved)[1].lower() != expected_suffix:
+        raise ValueError(f"reusable voice file must use {expected_suffix}")
+    if not path.isfile(resolved) or path.getsize(resolved) <= 0:
+        raise ValueError("reusable voice file does not exist or is empty")
+    return resolved
 
 
 def _complete_cached_stage(manifest, stage, inputs, outputs, artifacts):
@@ -308,6 +350,27 @@ def generate_audio(task_id, params, video_script):
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return None, None, None
 
+    reusable_audio_file = None
+    if not custom_audio_file and getattr(
+        params, "reusable_voice_fingerprint", None
+    ) == _voice_preview_fingerprint(params, video_script):
+        try:
+            reusable_audio_file = _resolve_reusable_voice_file(
+                getattr(params, "reusable_voice_audio_file", None), ".mp3"
+            )
+        except ValueError as exc:
+            logger.warning(f"reusable voice preview is invalid: {exc}")
+
+    if reusable_audio_file:
+        audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
+        shutil.copy2(reusable_audio_file, audio_file)
+        audio_duration = voice.get_audio_duration(audio_file)
+        if audio_duration <= 0:
+            logger.warning("reusable voice preview has no valid duration")
+            return None, None, None
+        logger.info("reusing full narration preview; TTS synthesis skipped")
+        return audio_file, audio_duration, None
+
     if not custom_audio_file:
         logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
@@ -316,6 +379,7 @@ def generate_audio(task_id, params, video_script):
             voice_name=voice.parse_voice_name(params.voice_name),
             voice_rate=params.voice_rate,
             voice_file=audio_file,
+            voice_volume=params.voice_volume,
         )
         if sub_maker is None:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -358,6 +422,23 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
+    if getattr(
+        params, "reusable_voice_fingerprint", None
+    ) == _voice_preview_fingerprint(params, video_script):
+        try:
+            reusable_subtitle = _resolve_reusable_voice_file(
+                getattr(params, "reusable_voice_subtitle_file", None), ".srt"
+            )
+        except ValueError as exc:
+            reusable_subtitle = None
+            logger.warning(f"reusable narration timeline is invalid: {exc}")
+        if reusable_subtitle:
+            shutil.copy2(reusable_subtitle, subtitle_path)
+            if subtitle.file_to_subtitles(subtitle_path):
+                logger.info("reusing narration preview timeline")
+                return subtitle_path
+            logger.warning("reusable narration timeline contains no valid subtitles")
+
     if sub_maker is None and subtitle_provider != "whisper":
         # 自定义音频不会经过 TTS，因此没有 Edge/Azure 等 TTS 返回的
         # sub_maker 时间轴。只有 Whisper 可以直接从音频文件转写字幕；
@@ -390,7 +471,46 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def _get_video_materials(task_id, params, video_terms, audio_duration):
+@performance.instrument_stage("storyboard")
+def generate_storyboard(
+    task_id,
+    params,
+    video_script,
+    video_terms,
+    subtitle_path,
+    audio_duration,
+):
+    preliminary = video_storyboard.build_video_plan(
+        subject=params.video_subject,
+        script=video_script,
+        terms=list(video_terms or []),
+        subtitle_path=subtitle_path,
+        audio_duration=float(audio_duration),
+    )
+    enrichment = []
+    if params.match_materials_to_script:
+        enrichment = llm.generate_scene_blueprint(
+            video_subject=params.video_subject,
+            video_script=video_script,
+            narration_segments=[scene.narration for scene in preliminary.scenes],
+            base_queries=list(video_terms or []),
+        )
+    plan = video_storyboard.build_video_plan(
+        subject=params.video_subject,
+        script=video_script,
+        terms=list(video_terms or []),
+        subtitle_path=subtitle_path,
+        audio_duration=float(audio_duration),
+        enrichment=enrichment,
+    )
+    storyboard_path = path.join(utils.task_dir(task_id), "storyboard.json")
+    video_storyboard.save_video_plan(plan, storyboard_path)
+    return plan, storyboard_path
+
+
+def _get_video_materials(
+    task_id, params, video_terms, audio_duration, storyboard=None
+):
     selected_sources = getattr(params, "video_sources", None) or [params.video_source]
     if "local" in selected_sources:
         logger.info("\n\n## preprocess local materials")
@@ -406,6 +526,13 @@ def _get_video_materials(task_id, params, video_terms, audio_duration):
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {', '.join(selected_sources)}")
+        if storyboard is not None and params.match_materials_to_script:
+            return material.download_storyboard_videos(
+                task_id=task_id,
+                scenes=storyboard.scenes,
+                sources=selected_sources,
+                video_aspect=params.video_aspect,
+            )
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
@@ -437,13 +564,17 @@ def _get_video_materials(task_id, params, video_terms, audio_duration):
 
 
 @performance.instrument_stage("materials")
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def get_video_materials(
+    task_id, params, video_terms, audio_duration, storyboard=None
+):
     with performance.network_slot:
-        return _get_video_materials(task_id, params, video_terms, audio_duration)
+        return _get_video_materials(
+            task_id, params, video_terms, audio_duration, storyboard
+        )
 
 
 def _generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path
+    task_id, params, downloaded_videos, audio_file, subtitle_path, storyboard=None
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -479,6 +610,24 @@ def _generate_final_videos(
             video_transition_mode=video_transition_mode,
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
+            clip_durations=(
+                [
+                    scene.duration
+                    for scene in storyboard.scenes
+                    if scene.selected_clip is not None
+                ]
+                if storyboard is not None and params.match_materials_to_script
+                else None
+            ),
+            clip_starts=(
+                [
+                    float(scene.selected_clip.get("start_time", 0))
+                    for scene in storyboard.scenes
+                    if scene.selected_clip is not None
+                ]
+                if storyboard is not None and params.match_materials_to_script
+                else None
+            ),
         )
 
         _progress += 50 / params.video_count / 2
@@ -529,11 +678,16 @@ def _generate_final_videos(
 
 @performance.instrument_stage("video_render")
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path
+    task_id, params, downloaded_videos, audio_file, subtitle_path, storyboard=None
 ):
     with performance.render_slot:
         return _generate_final_videos(
-            task_id, params, downloaded_videos, audio_file, subtitle_path
+            task_id,
+            params,
+            downloaded_videos,
+            audio_file,
+            subtitle_path,
+            storyboard,
         )
 
 
@@ -696,7 +850,12 @@ def start(
         logger.info(f"reusing cached subtitle: task_id={task_id}")
     else:
         subtitle_provider = subtitle_inputs["subtitle_provider"]
-        if cached_audio and params.subtitle_enabled and subtitle_provider != "whisper":
+        if (
+            cached_audio
+            and params.subtitle_enabled
+            and subtitle_provider != "whisper"
+            and not getattr(params, "reusable_voice_subtitle_file", None)
+        ):
             audio_file, audio_duration, sub_maker = generate_audio(
                 task_id, params, video_script
             )
@@ -734,13 +893,145 @@ def start(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
-    # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+    # 5. Build a timed storyboard before selecting materials.
+    storyboard_inputs = {
+        "version": 1,
+        "script": video_script,
+        "terms": list(video_terms or []),
+        "audio_duration": float(audio_duration),
+        "subtitle_sha256": hash_file(subtitle_path) if subtitle_path else "",
+        "match_materials_to_script": bool(params.match_materials_to_script),
+    }
+    cached_storyboard = _restore_cached_stage(
+        task_manifest, "storyboard", storyboard_inputs
     )
+    storyboard_path = path.join(utils.task_dir(task_id), "storyboard.json")
+    if cached_storyboard and "storyboard" in cached_storyboard["artifacts"]:
+        storyboard_path = cached_storyboard["artifacts"]["storyboard"]
+        storyboard = video_storyboard.load_video_plan(storyboard_path)
+        logger.info(f"reusing cached storyboard: task_id={task_id}")
+    else:
+        storyboard, storyboard_path = generate_storyboard(
+            task_id,
+            params,
+            video_script,
+            video_terms,
+            subtitle_path,
+            audio_duration,
+        )
+        _complete_cached_stage(
+            task_manifest,
+            "storyboard",
+            storyboard_inputs,
+            {"scene_count": len(storyboard.scenes)},
+            {"storyboard": storyboard_path},
+        )
+
+    scene_overrides = getattr(params, "storyboard_scene_overrides", {}) or {}
+    locked_scene_ids = set(
+        getattr(params, "locked_storyboard_scene_ids", []) or []
+    )
+    storyboard_changed = False
+    if scene_overrides or locked_scene_ids:
+        for scene in storyboard.scenes:
+            scene.locked = (
+                scene.scene_id in locked_scene_ids
+                and bool(scene.selected_clip)
+                and path.isfile(
+                    str((scene.selected_clip or {}).get("local_path") or "")
+                )
+            )
+            replacement_query = str(scene_overrides.get(scene.scene_id, "")).strip()
+            if replacement_query:
+                scene.query = replacement_query
+                scene.fallback_queries = []
+                scene.selected_clip = None
+                scene.fidelity_score = None
+                scene.warnings = []
+                scene.locked = False
+                storyboard_changed = True
+        if storyboard_changed or locked_scene_ids:
+            video_storyboard.save_video_plan(storyboard, storyboard_path)
+            _complete_cached_stage(
+                task_manifest,
+                "storyboard",
+                storyboard_inputs,
+                {"scene_count": len(storyboard.scenes)},
+                {"storyboard": storyboard_path},
+            )
+
+    if stop_at == "storyboard":
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            storyboard_path=storyboard_path,
+        )
+        return {
+            "storyboard_path": storyboard_path,
+            "storyboard": storyboard.model_dump(mode="json"),
+        }
+
+    # 6. Get or restore scene-selected video materials.
+    material_inputs = {
+        "storyboard_sha256": hash_file(storyboard_path),
+        "sources": list(selected_sources),
+        "video_aspect": str(params.video_aspect),
+        "video_fit_mode": params.video_fit_mode,
+    }
+    cached_materials = _restore_cached_stage(
+        task_manifest, "materials", material_inputs
+    )
+    downloaded_videos = []
+    if cached_materials:
+        candidate_paths = cached_materials["outputs"].get("video_paths", [])
+        if isinstance(candidate_paths, list) and all(
+            isinstance(item, str) and path.isfile(item) for item in candidate_paths
+        ):
+            downloaded_videos = candidate_paths
+            storyboard_artifact = cached_materials["artifacts"].get("storyboard")
+            if storyboard_artifact:
+                storyboard_path = storyboard_artifact
+                storyboard = video_storyboard.load_video_plan(storyboard_path)
+            logger.info(f"reusing cached storyboard materials: task_id={task_id}")
+    if not downloaded_videos:
+        downloaded_videos = get_video_materials(
+            task_id, params, video_terms, audio_duration, storyboard
+        )
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
+    if params.match_materials_to_script:
+        video_storyboard.save_video_plan(storyboard, storyboard_path)
+        _complete_cached_stage(
+            task_manifest,
+            "storyboard",
+            storyboard_inputs,
+            {"scene_count": len(storyboard.scenes)},
+            {"storyboard": storyboard_path},
+        )
+    material_artifacts = {"storyboard": storyboard_path}
+    materials_file = path.join(utils.task_dir(task_id), "materials.json")
+    if path.isfile(materials_file):
+        material_artifacts["materials"] = materials_file
+    material_inputs["storyboard_sha256"] = hash_file(storyboard_path)
+    _complete_cached_stage(
+        task_manifest,
+        "materials",
+        material_inputs,
+        {"video_paths": downloaded_videos},
+        material_artifacts,
+    )
+    quality_report_path = path.join(
+        utils.task_dir(task_id), "quality-report.json"
+    )
+    quality_report = video_quality.validate_storyboard(
+        storyboard,
+        minimum_score=float(
+            config.app.get("clip_relevance_threshold", 0.235) or 0.235
+        ),
+    )
+    video_quality.save_quality_report(quality_report, quality_report_path)
 
     if stop_at == "materials":
         sm.state.update_task(
@@ -749,7 +1040,12 @@ def start(
             progress=100,
             materials=downloaded_videos,
         )
-        return {"materials": downloaded_videos}
+        return {
+            "materials": downloaded_videos,
+            "storyboard_path": storyboard_path,
+            "storyboard": storyboard.model_dump(mode="json"),
+            "quality_report": quality_report,
+        }
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
@@ -758,14 +1054,25 @@ def start(
     if type(params.video_concat_mode) is str:
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
-    # 6. Generate final videos
+    # 7. Generate final videos
     final_video_paths, combined_video_paths, warnings = generate_final_videos(
-        task_id, params, downloaded_videos, audio_file, subtitle_path
+        task_id,
+        params,
+        downloaded_videos,
+        audio_file,
+        subtitle_path,
+        storyboard,
     )
 
     if not final_video_paths:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
+    quality_report = video_quality.validate_final_videos(
+        quality_report,
+        final_video_paths,
+        float(audio_duration),
+    )
+    video_quality.save_quality_report(quality_report, quality_report_path)
 
     social_metadata = save_social_metadata(task_id, params, video_script)
 
@@ -946,6 +1253,9 @@ def start(
         "tiktok_upload_results": tiktok_upload_results if tiktok_upload_results else None,
         "cross_post_results": cross_post_results if cross_post_results else None,
         "warnings": warnings or None,
+        "storyboard_path": storyboard_path,
+        "quality_report_path": quality_report_path,
+        "quality_report": quality_report,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
